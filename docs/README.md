@@ -279,6 +279,19 @@ Lists VPCs, subnets, security groups. Stored as resources for graph context.
 ### `core/privilege_escalation.py`
 **analyze(db, account=None)** — checks every principal against the [PrivEsc Catalogue](#privilege-escalation-catalogue). Returns deduplicated `PrivEscFinding` list sorted by severity.
 
+### `core/attack_chains.py`
+**detect_chains(principal, db)** — multi-hop attack chain detection engine. Identifies sequences of permissions that, combined, allow privilege escalation. Families covered:
+
+| Family | Name | Description |
+|--------|------|-------------|
+| I | IAM Self-Modification | Identity can modify its own policies or create new permissions for itself |
+| II | PassRole + Compute Service | Abuses `iam:PassRole` to inject a privileged role into a managed service (Lambda, EC2, ECS, Glue) |
+| III | Compute Credential Theft | Steals credentials via IMDS or environment variables from compromised instances or functions |
+| IV | Secret Exfiltration → Credential Reuse | Exfiltrates secrets from Secrets Manager or SSM Parameter Store and reuses them as another identity's credential |
+| V | Account Takeover | Combines permissions to gain administrative control of the account |
+| VI | Group Membership | Escalates by adding the identity to a group with higher permissions |
+| VII | Cross-Account Lateral Movement | Moves laterally between accounts via permissive trust policies or misconfigured cross-account roles |
+
 ### `core/resource_graph.py`
 **build_graph(db)** — builds a `networkx.DiGraph` from all DB content, then calls `_add_trust_edges()`.
 
@@ -364,10 +377,10 @@ Base URL: `http://localhost:3000` (default)
   "hops":  [
     {
       "from_id":    "principal:arn:...",
-      "from_label": "IAMRole...",
+      "from_label": "Role-name1...",
       "from_type":  "role",
       "to_id":      "principal:arn:...",
-      "to_label":   "dev-role",
+      "to_label":   "Role-name2",
       "to_type":    "role",
       "edge_type":  "can_assume",
       "explanation": "Can assume this role via trust policy",
@@ -392,8 +405,8 @@ Returns findings limited to:
 | Prefix | Example | Type |
 |--------|---------|------|
 | `account:` | `account:123456789012` | Account |
-| `principal:` | `principal:arn:aws:iam::123456789012:role/dev-role` | IAM principal |
-| `policy:` | `policy:arn:aws:iam::123456789012:policy/MyPolicy` | IAM policy |
+| `principal:` | `principal:arn:aws:iam::123456789012:role/role-name` | IAM principal |
+| `policy:` | `policy:arn:aws:iam::123456789012:policy/policy-name` | IAM policy |
 | `resource:` | `resource:arn:aws:lambda::123456789012:function:myFn` | AWS resource |
 | `external:` | `external:arn:aws:sts::...` | Unresolved trust principal |
 

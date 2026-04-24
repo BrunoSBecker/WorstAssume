@@ -44,7 +44,7 @@ Open `http://localhost:3000` in your browser.
 ### Option B — Local (Python + Node)
 
 ```bash
-git clone https://github.com/your-org/worstassume.git
+git clone https://github.com/BrunoSBecke/WorstAssume.git
 cd worstassume
 
 # Python env

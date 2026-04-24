@@ -1,0 +1,76 @@
+# ─── Python ───────────────────────────────────────────────────────────────────
+__pycache__/
+*.py[cod]
+*$py.class
+*.pyo
+*.pyd
+.Python
+*.egg-info/
+dist/
+build/
+*.egg
+*.whl
+MANIFEST
+.eggs/
+
+# Virtual environments
+venv/
+.venv/
+env/
+.env/
+ENV/
+bin/
+lib/
+lib64/
+include/
+pyvenv.cfg
+
+# ─── Database ─────────────────────────────────────────────────────────────────
+*.sqlite
+*.sqlite3
+*.db
+~/.worstassume/
+
+# ─── Secrets / credentials ────────────────────────────────────────────────────
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.p12
+*.pfx
+
+# ─── Frontend build ───────────────────────────────────────────────────────────
+worstassume/viz/frontend/node_modules/
+worstassume/viz/frontend/dist/
+worstassume/viz/frontend/.vite/
+worstassume/viz/frontend/*.local
+
+# ─── IDE / OS ─────────────────────────────────────────────────────────────────
+.vscode/
+.idea/
+.agents/
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# ─── Testing ──────────────────────────────────────────────────────────────────
+.pytest_cache/
+.coverage
+htmlcov/
+.tox/
+coverage.xml
+*.cover
+
+# ─── Logs / temp ──────────────────────────────────────────────────────────────
+*.log
+*.tmp
+*.bak
+logs/
+tmp/
+
+# ─── Docker ───────────────────────────────────────────────────────────────────
+.docker/

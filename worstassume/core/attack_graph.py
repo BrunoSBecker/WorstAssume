@@ -167,7 +167,8 @@ class NeighborContext:
             expl = _EXPLANATIONS.get(path_id, action)
             targets = [
                 v for v in self.principals
-                if not target_filter or v.principal_type == target_filter
+                if (not target_filter or v.principal_type == target_filter)
+                and not _is_aws_managed_principal(v)
             ]
             log.debug("[iam] %s can %s → %d targets",
                       attacker.arn, action, len(targets))
@@ -519,6 +520,26 @@ def _actor_can_assume(actor: Principal, target_role: Principal) -> bool:
 def _normalize_stmts(policy: dict) -> list:
     stmts = policy.get("Statement", [])
     return [stmts] if isinstance(stmts, dict) else stmts
+
+
+def _is_aws_managed_principal(p: Principal) -> bool:
+    """Return True for AWS-managed principals that are not viable IAM attack targets.
+
+    Covers:
+    - Service-linked roles: path contains '/aws-service-role/' or name starts
+      with 'AWSServiceRole'.  AWS blocks iam:PutRolePolicy, iam:AttachRolePolicy,
+      etc. on these at the API level, so edges to them are false positives.
+    - SSO reserved roles: ARN contains '/AWSReservedSSO_' or the legacy
+      '/aws-reserved/sso.amazonaws.com/' path segment.
+    """
+    arn  = p.arn  or ""
+    path = p.path or "/"
+    return (
+        "/aws-service-role/" in path
+        or p.name.startswith("AWSServiceRole")
+        or "/AWSReservedSSO_" in arn
+        or "/aws-reserved/sso.amazonaws.com/" in arn
+    )
 
 
 def _role_trusts_service(role: Principal, service_principal: str) -> bool:

@@ -106,6 +106,24 @@ DEFAULT_WRITE_VERBS: frozenset[str] = frozenset({
     "guardduty:deletedetector", "config:deleteconfigrule",
 })
 
+# Subset of DEFAULT_WRITE_VERBS that are direct IAM privilege-escalation primitives.
+# These receive HIGH severity in _check_resource_wildcards() instead of the default MEDIUM,
+# ensuring they surface even when the UI threshold is set to HIGH.
+_HIGH_SEVERITY_VERBS: frozenset[str] = frozenset({
+    "iam:createpolicyversion",
+    "iam:setroledefaultpolicyversion",
+    "iam:attachuserpolicy",
+    "iam:attachrolepolicy",
+    "iam:attachgrouppolicy",
+    "iam:putuserpolicy",
+    "iam:putrolepolicy",
+    "iam:putgrouppolicy",
+    "iam:updateassumerolepolicy",
+    "iam:passrole",
+    "iam:createaccesskey",
+    "iam:updateloginprofile",
+})
+
 # ─── SeverityConfig ───────────────────────────────────────────────────────────
 
 
@@ -478,7 +496,10 @@ def _check_resource_wildcards(p: Principal, cfg: SeverityConfig) -> list[_RawFin
                 if path_id in seen:
                     continue  # one finding per unique action per principal
                 seen.add(path_id)
-                sev = cfg.resolve(path_id, "MEDIUM")
+                # Known IAM priv-esc primitives surface as HIGH so they are
+                # visible when the UI/CLI threshold is set to HIGH (the default).
+                default_sev = "HIGH" if action in _HIGH_SEVERITY_VERBS else "MEDIUM"
+                sev = cfg.resolve(path_id, default_sev)
                 findings.append(_RawFinding(
                     entity_arn=p.arn, entity_type=p.principal_type, entity_name=p.name,
                     category="RESOURCE_WILDCARD", path_id=path_id,

@@ -6,6 +6,7 @@ Writes AttackPath + AttackPathStep ORM rows via persist().
 """
 from __future__ import annotations
 
+import hashlib
 import logging
 from collections import deque
 from dataclasses import dataclass, field
@@ -219,11 +220,24 @@ def _resolve_objective_bfs(objective: str | None, ctx) -> set[str] | None:
         # Any principal that has this action in its action_cache
         if obj_rest == "*:*":
             return {p.arn for p in ctx.principals}  # unconstrained over principals
-        from worstassume.core.iam_actions import _can_do
-        return {
+        from worstassume.core.iam_actions import _can_do, _is_dangerous_action_set
+        targets = {
             arn for arn, actions in ctx.action_cache.items()
             if _can_do(actions, obj_rest)
         }
+        # For IAM permission objectives, also terminate at any principal that
+        # holds a dangerous action (iam:CreatePolicyVersion, iam:PutRolePolicy,
+        # etc.).  Reaching such a principal is equivalent to reaching the
+        # objective: the attacker can self-escalate to full admin from there
+        # without any further hops.  This prevents the BFS from walking past
+        # an already-dangerous intermediate role to land on a pre-existing
+        # admin user, which produces confusing "attack this admin user" paths.
+        if obj_rest.startswith("iam:"):
+            targets |= {
+                arn for arn, actions in ctx.action_cache.items()
+                if _is_dangerous_action_set(actions)
+            }
+        return targets
 
     return set()
 
@@ -365,7 +379,15 @@ def persist(
     persisted: list[AttackPath] = []
 
     for result in paths:
-        summary = f"{result.from_arn} → {result.to_arn} ({result.hops} hops)"
+        # Include a short fingerprint of the step sequence so two paths that
+        # reach the same target in the same number of hops via *different*
+        # intermediate nodes get distinct dedup keys.  Without this the ORM
+        # cascade delete fails silently (SAWarning) and steps accumulate.
+        _step_key = ",".join(
+            f"{s['action']}:{s['target']}" for s in result.steps
+        )
+        _sig = hashlib.md5(_step_key.encode()).hexdigest()[:8]
+        summary = f"{result.from_arn} → {result.to_arn} ({result.hops} hops) [{_sig}]"
 
         # Check for existing row (dedup)
         existing = (

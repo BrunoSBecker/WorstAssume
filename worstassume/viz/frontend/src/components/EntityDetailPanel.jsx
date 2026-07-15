@@ -134,6 +134,81 @@ function PermissionsList({ actions, label = 'Permissions' }) {
   )
 }
 
+// ─── Resource metadata (network / IMDS / service config) ─────────────────────
+
+function humanizeKey(k) {
+  return k.replace(/([A-Z])/g, ' $1').replace(/[_-]/g, ' ').replace(/\s+/g, ' ').trim()
+    .replace(/\b\w/g, c => c.toUpperCase())
+}
+
+function ResourceMetadataBlock({ metadata }) {
+  if (!metadata || typeof metadata !== 'object' || Object.keys(metadata).length === 0) return null
+
+  const imds = metadata.MetadataOptions
+  const imdsWeak = imds && imds.HttpTokens && imds.HttpTokens !== 'required'
+
+  // Keys rendered specially or intentionally hidden (large blobs)
+  const skip = new Set(['MetadataOptions', 'security_groups', 'attaches_to_vpcs', 'policy', 'resource_policy'])
+  const rows = []
+  for (const [k, v] of Object.entries(metadata)) {
+    if (skip.has(k)) continue
+    if (v === null || v === undefined || v === '') continue
+    if (typeof v === 'object') continue
+    rows.push([humanizeKey(k), typeof v === 'boolean' ? (v ? 'yes' : 'no') : String(v)])
+  }
+
+  const sgs = Array.isArray(metadata.security_groups) ? metadata.security_groups : null
+  const attaches = Array.isArray(metadata.attaches_to_vpcs) ? metadata.attaches_to_vpcs : null
+  const hasPolicy = metadata.policy || metadata.resource_policy
+
+  const rowStyle = { display: 'flex', gap: '8px', fontSize: '12px', fontFamily: 'IBM Plex Mono' }
+  const keyStyle = { color: 'var(--text-faint)', minWidth: '110px', flexShrink: 0 }
+  const valStyle = { color: 'var(--text)', wordBreak: 'break-all' }
+
+  return (
+    <SbBlock label="Configuration">
+      <div style={{ display: 'flex', flexDirection: 'column', gap: '4px', marginTop: '6px' }}>
+        {imds && (
+          <div style={{ ...rowStyle, alignItems: 'center' }}>
+            <span style={keyStyle}>IMDS</span>
+            <span style={{
+              padding: '1px 7px', borderRadius: '2px', fontSize: '10px', fontWeight: 600,
+              letterSpacing: '0.05em', whiteSpace: 'nowrap',
+              background: imdsWeak ? 'rgba(192,48,48,.12)' : 'rgba(46,125,82,.12)',
+              color: imdsWeak ? 'var(--red-hi)' : 'var(--green-hi)',
+              border: `1px solid ${imdsWeak ? 'rgba(192,48,48,.3)' : 'rgba(46,125,82,.25)'}`,
+            }}>{imdsWeak ? 'IMDSv1 allowed ⚠' : 'IMDSv2 required'}</span>
+          </div>
+        )}
+        {rows.map(([k, v]) => (
+          <div key={k} style={rowStyle}>
+            <span style={keyStyle}>{k}</span>
+            <span style={valStyle}>{v}</span>
+          </div>
+        ))}
+        {sgs && sgs.length > 0 && (
+          <div style={rowStyle}>
+            <span style={keyStyle}>Security Groups</span>
+            <span style={valStyle}>{sgs.join(', ')}</span>
+          </div>
+        )}
+        {attaches && attaches.length > 0 && (
+          <div style={rowStyle}>
+            <span style={keyStyle}>Attached VPCs</span>
+            <span style={valStyle}>{attaches.join(', ')}</span>
+          </div>
+        )}
+        {hasPolicy && (
+          <div style={rowStyle}>
+            <span style={keyStyle}>Resource Policy</span>
+            <span style={valStyle}>present</span>
+          </div>
+        )}
+      </div>
+    </SbBlock>
+  )
+}
+
 // ─── Main component ───────────────────────────────────────────────────────────
 
 export default function EntityDetailPanel({ entity, findings, onClose, onViewGraph, style = {} }) {
@@ -354,6 +429,9 @@ export default function EntityDetailPanel({ entity, findings, onClose, onViewGra
               )}
             </div>
           </SbBlock>
+
+          {/* Network / IMDS / service configuration */}
+          <ResourceMetadataBlock metadata={entity.metadata} />
 
           {/* Execution role permissions */}
           {executionRole && actions.length > 0 && (

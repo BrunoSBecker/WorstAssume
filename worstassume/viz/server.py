@@ -421,6 +421,8 @@ class EntityIndex:
                     "arn": r.execution_role.arn,
                 } if r.execution_role else None,
                 "actions": actions,
+                # Service-specific detail (IMDS, IPs, VPC/subnet/SG, etc.)
+                "metadata": r.extra,
             }, "resource", actions, [])
 
         idx.type_counts = {
@@ -1214,6 +1216,18 @@ async def api_node_detail(node_id: str):
                 data["attached_principals"] = [p.arn for p in pol.principals]
                 if pol.document:
                     data["policy_document"] = json.dumps(pol.document, indent=2)
+
+        if node_id.startswith("resource:"):
+            arn = node_id[len("resource:"):]
+            res = db.query(Resource).filter_by(arn=arn).first()
+            if res:
+                data["metadata"] = res.extra
+                if res.execution_role:
+                    data["execution_role"] = {
+                        "name": res.execution_role.name,
+                        "arn": res.execution_role.arn,
+                    }
+                    data["actions"] = _collect_principal_actions(res.execution_role)
 
         return JSONResponse(content=data)
     finally:

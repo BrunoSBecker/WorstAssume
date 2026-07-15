@@ -76,6 +76,7 @@ function makeData(n) {
     policies: n.policies || [],
     attached_principals: n.attached_principals || [],
     execution_role: n.execution_role || null,
+    metadata: n.metadata || null,
   }
 }
 
@@ -95,8 +96,12 @@ function dataToEntity(d) {
     service: d.service,
     resource_type: d.resource_type,
     region: d.region,
+    metadata: d.metadata || null,
   }
 }
+
+// Network-topology edge types (built from resource metadata in graph_store)
+const NETWORK_EDGE_LABELS = { in_vpc: 'in vpc', in_subnet: 'in subnet', uses_sg: 'uses sg' }
 
 // Build cytoscape elements directly from path steps (no API call)
 function pathStepsToElements(steps) {
@@ -225,6 +230,26 @@ function buildStylesheet(nodeSize, edgeOpacity) {
         'color': '#d97c14',
         'text-rotation': 'autorotate',
         'text-margin-y': -8,
+        'overlay-opacity': 0,
+      },
+    },
+    // Network-topology edges (in_vpc / in_subnet / uses_sg) — teal, labelled
+    {
+      selector: 'edge[edgeType = "in_vpc"], edge[edgeType = "in_subnet"], edge[edgeType = "uses_sg"]',
+      style: {
+        'width': 1.5,
+        'line-color': '#2a9d8f',
+        'target-arrow-color': '#2a9d8f',
+        'target-arrow-shape': 'triangle',
+        'curve-style': 'bezier',
+        'arrow-scale': 0.7,
+        'opacity': 0.9,
+        'label': 'data(label)',
+        'font-size': 7,
+        'font-family': 'IBM Plex Mono, monospace',
+        'color': '#3fb8a8',
+        'text-rotation': 'autorotate',
+        'text-margin-y': -6,
         'overlay-opacity': 0,
       },
     },
@@ -434,7 +459,12 @@ export default function GraphViewer({ nodeIds = [], pathSteps = [], onClose, onN
               const eid = e.id || `${e.source}--${e.edge_type || 'edge'}--${e.target}`
               if (!existingIds.has(eid)) {
                 existingIds.add(eid)
-                toAdd.push({ group: 'edges', data: { id: eid, source: e.source, target: e.target } })
+                const netLabel = NETWORK_EDGE_LABELS[e.edge_type]
+                toAdd.push({ group: 'edges', data: {
+                  id: eid, source: e.source, target: e.target,
+                  edgeType: netLabel ? e.edge_type : (e.edge_type || 'edge'),
+                  label: netLabel || '',
+                } })
               }
             })
         } catch (err) { console.warn('Load failed:', qid, err.message) }
@@ -592,6 +622,12 @@ export default function GraphViewer({ nodeIds = [], pathSteps = [], onClose, onN
                 <div style={{ display: 'flex', alignItems: 'center', gap: '5px', fontSize: '10px', marginBottom: 4 }}>
                   <div style={{ width: 20, height: 2, background: '#d97c14', borderBottom: '2px dashed #d97c14' }} />
                   <span style={{ color: 'var(--amber)' }}>attack step</span>
+                </div>
+              )}
+              {!isPathMode && (
+                <div style={{ display: 'flex', alignItems: 'center', gap: '5px', fontSize: '10px', marginBottom: 4 }}>
+                  <div style={{ width: 20, height: 2, background: '#2a9d8f' }} />
+                  <span style={{ color: '#3fb8a8' }}>network link</span>
                 </div>
               )}
               {[['Role', '⚙', '#3a9ab0'], ['User', '👤', '#3dab6e'], ['Group', '👥', '#9a7fc8'], ['Policy', '📄', '#c878b0'], ['Resource', '☁', '#d97c14'], ['Account', '🔷', '#6070a0']].map(([lbl, icon, col]) => (

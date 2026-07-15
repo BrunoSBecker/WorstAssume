@@ -152,6 +152,103 @@ class TestBuild:
         assert edge.edge_type == "cross_account"
 
 
+# ── Network topology edges (Phase 2) ──────────────────────────────────────────
+
+@pytest.fixture
+def network_store(db_session, account_a):
+    """A store with a VPC, subnet, SG, instance, IGW and NAT gateway."""
+    base = "arn:aws:ec2:us-east-1:111111111111"
+    upsert_resource(
+        db_session, account_a, arn=f"{base}:vpc/vpc-1",
+        service="ec2", resource_type="vpc", name="vpc-1",
+        metadata={"vpc_id": "vpc-1", "cidr": "10.0.0.0/16", "is_default": False},
+    )
+    upsert_resource(
+        db_session, account_a, arn=f"{base}:subnet/subnet-1",
+        service="vpc", resource_type="subnet", name="subnet-1",
+        metadata={"subnet_id": "subnet-1", "vpc_id": "vpc-1", "cidr": "10.0.1.0/24", "public": True},
+    )
+    upsert_resource(
+        db_session, account_a, arn=f"{base}:security-group/sg-1",
+        service="ec2", resource_type="security-group", name="sg-1",
+        metadata={"group_id": "sg-1", "vpc_id": "vpc-1", "description": "web"},
+    )
+    upsert_resource(
+        db_session, account_a, arn=f"{base}:instance/i-1",
+        service="ec2", resource_type="instance", name="i-1",
+        metadata={
+            "instance_id": "i-1", "vpc_id": "vpc-1", "subnet_id": "subnet-1",
+            "security_groups": ["sg-1"], "private_ip": "10.0.1.5",
+            "MetadataOptions": {"HttpTokens": "optional"},
+        },
+    )
+    upsert_resource(
+        db_session, account_a, arn=f"{base}:internet-gateway/igw-1",
+        service="vpc", resource_type="internet-gateway", name="igw-1",
+        metadata={"attaches_to_vpcs": ["vpc-1"]},
+    )
+    upsert_resource(
+        db_session, account_a, arn=f"{base}:natgateway/nat-1",
+        service="vpc", resource_type="nat-gateway", name="nat-1",
+        metadata={"vpc_id": "vpc-1", "subnet_id": "subnet-1", "state": "available"},
+    )
+    db_session.commit()
+    return GraphStore.build(db_session), base
+
+
+class TestNetworkEdges:
+    def _edge_type(self, store, src, dst):
+        e = store.edges.get((src, dst))
+        return e.edge_type if e else None
+
+    def test_instance_in_vpc(self, network_store):
+        store, base = network_store
+        assert self._edge_type(store, f"resource:{base}:instance/i-1", f"resource:{base}:vpc/vpc-1") == "in_vpc"
+
+    def test_instance_in_subnet(self, network_store):
+        store, base = network_store
+        assert self._edge_type(store, f"resource:{base}:instance/i-1", f"resource:{base}:subnet/subnet-1") == "in_subnet"
+
+    def test_instance_uses_sg(self, network_store):
+        store, base = network_store
+        assert self._edge_type(store, f"resource:{base}:instance/i-1", f"resource:{base}:security-group/sg-1") == "uses_sg"
+
+    def test_subnet_in_vpc(self, network_store):
+        store, base = network_store
+        assert self._edge_type(store, f"resource:{base}:subnet/subnet-1", f"resource:{base}:vpc/vpc-1") == "in_vpc"
+
+    def test_sg_in_vpc(self, network_store):
+        store, base = network_store
+        assert self._edge_type(store, f"resource:{base}:security-group/sg-1", f"resource:{base}:vpc/vpc-1") == "in_vpc"
+
+    def test_igw_in_vpc(self, network_store):
+        store, base = network_store
+        assert self._edge_type(store, f"resource:{base}:internet-gateway/igw-1", f"resource:{base}:vpc/vpc-1") == "in_vpc"
+
+    def test_nat_in_vpc_and_subnet(self, network_store):
+        store, base = network_store
+        assert self._edge_type(store, f"resource:{base}:natgateway/nat-1", f"resource:{base}:vpc/vpc-1") == "in_vpc"
+        assert self._edge_type(store, f"resource:{base}:natgateway/nat-1", f"resource:{base}:subnet/subnet-1") == "in_subnet"
+
+    def test_vpc_has_no_self_edge(self, network_store):
+        store, base = network_store
+        assert (f"resource:{base}:vpc/vpc-1", f"resource:{base}:vpc/vpc-1") not in store.edges
+
+    def test_metadata_surfaced_on_node(self, network_store):
+        store, base = network_store
+        inst = store.nodes[f"resource:{base}:instance/i-1"]
+        assert inst.metadata["MetadataOptions"]["HttpTokens"] == "optional"
+        assert inst.to_dict()["metadata"]["private_ip"] == "10.0.1.5"
+
+    def test_vpc_neighbors_include_consumers(self, network_store):
+        store, base = network_store
+        result = store.neighbors(f"resource:{base}:vpc/vpc-1", depth=1)
+        node_ids = {n["id"] for n in result["nodes"]}
+        # A VPC's predecessors (consumers) should be reachable
+        assert f"resource:{base}:instance/i-1" in node_ids
+        assert f"resource:{base}:subnet/subnet-1" in node_ids
+
+
 # ── GraphStore.neighbors() ────────────────────────────────────────────────────
 
 class TestNeighbors:

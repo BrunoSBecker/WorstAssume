@@ -42,6 +42,8 @@ class NodeAttrs:
     # Extra display fields (populated for principals)
     actions: list[str] = field(default_factory=list)
     trust_principals: list[str] = field(default_factory=list)
+    # Service-specific metadata (populated for resources: IMDS, IPs, VPC, etc.)
+    metadata: dict | None = None
 
     def to_dict(self) -> dict:
         d = {
@@ -60,6 +62,8 @@ class NodeAttrs:
             d["trust_principals"] = self.trust_principals
         if self.trust_policy:
             d["trust_policy"] = json.dumps(self.trust_policy)
+        if self.metadata:
+            d["metadata"] = self.metadata
         return d
 
 
@@ -239,6 +243,7 @@ class GraphStore:
                 trust_policy=data.get("trust_policy"),
                 actions=actions_map.get(arn, []) if arn else [],
                 trust_principals=trust_map.get(arn, []) if arn else [],
+                metadata=data.get("metadata"),
             )
             self.nodes[node_id] = attrs
             self.successors[node_id] = []
@@ -420,6 +425,7 @@ def _build_nx_graph(
             label=res.name or res.arn,
             arn=res.arn,
             account_id=res.account.account_id if res.account else None,
+            metadata=res.extra,
         )
         if res.account:
             G.add_edge(
@@ -431,6 +437,9 @@ def _build_nx_graph(
                 rid, f"principal:{res.execution_role.arn}",
                 edge_type="execution_role",
             )
+
+    # Network topology edges (instance ↔ subnet ↔ vpc ↔ sg) from existing metadata
+    _add_network_edges(G, resources)
 
     # Cross-account trust links
     for link in cross_links:
@@ -451,6 +460,61 @@ def _build_nx_graph(
 
     log.info("[graph_store] nx graph: %d nodes, %d edges", G.number_of_nodes(), G.number_of_edges())
     return G
+
+
+def _add_network_edges(G: nx.DiGraph, resources: list) -> None:
+    """
+    Infer VPC network-topology edges from resource metadata (no re-enumeration).
+
+    Creates:
+      instance   --in_vpc-->    vpc
+      instance   --in_subnet--> subnet
+      instance   --uses_sg-->   security-group
+      subnet     --in_vpc-->    vpc
+      sg / nat / route-table / igw --in_vpc--> vpc
+      nat        --in_subnet--> subnet
+
+    Edge direction is consumer → container, so a VPC's predecessors answer
+    "what uses this VPC?".
+    """
+    vpc_by_id: dict[str, str] = {}
+    subnet_by_id: dict[str, str] = {}
+    sg_by_id: dict[str, str] = {}
+
+    for res in resources:
+        meta = res.extra or {}
+        rid = f"resource:{res.arn}"
+        if res.resource_type == "vpc" and meta.get("vpc_id"):
+            vpc_by_id[meta["vpc_id"]] = rid
+        elif res.resource_type == "subnet" and meta.get("subnet_id"):
+            subnet_by_id[meta["subnet_id"]] = rid
+        elif res.resource_type == "security-group" and meta.get("group_id"):
+            sg_by_id[meta["group_id"]] = rid
+
+    def link(src_rid: str, target_rid: str | None, edge_type: str) -> None:
+        if target_rid and src_rid != target_rid and src_rid in G and target_rid in G:
+            G.add_edge(src_rid, target_rid, edge_type=edge_type)
+
+    for res in resources:
+        rid = f"resource:{res.arn}"
+        if rid not in G:
+            continue
+        meta = res.extra or {}
+        rtype = res.resource_type
+
+        vpc_id = meta.get("vpc_id")
+        if vpc_id and rtype != "vpc":
+            link(rid, vpc_by_id.get(vpc_id), "in_vpc")
+
+        subnet_id = meta.get("subnet_id")
+        if subnet_id and rtype != "subnet":
+            link(rid, subnet_by_id.get(subnet_id), "in_subnet")
+
+        for gid in meta.get("security_groups") or []:
+            link(rid, sg_by_id.get(gid), "uses_sg")
+
+        for vid in meta.get("attaches_to_vpcs") or []:
+            link(rid, vpc_by_id.get(vid), "in_vpc")
 
 
 def _add_trust_edges(G: nx.DiGraph, principals: list) -> None:

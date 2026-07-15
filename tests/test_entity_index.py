@@ -155,6 +155,12 @@ def index(db_session, account_a, account_b):
         name="i-123",
         region="us-east-1",
         execution_role=bob,
+        metadata_json=json.dumps({
+            "instance_id": "i-123",
+            "private_ip": "10.0.1.5",
+            "vpc_id": "vpc-1",
+            "MetadataOptions": {"HttpTokens": "optional"},
+        }),
     ))
     db_session.add(Resource(
         account_id=account_a.id,
@@ -211,6 +217,14 @@ def test_filter_by_service(index):
     res = index.query(service="ec2", page_size=100)
     assert res["total"] == 1
     assert res["items"][0]["arn"].endswith("instance/i-123")
+
+
+def test_resource_metadata_surfaced(index):
+    res = index.query(service="ec2", page_size=100)
+    meta = res["items"][0]["metadata"]
+    assert meta["private_ip"] == "10.0.1.5"
+    assert meta["vpc_id"] == "vpc-1"
+    assert meta["MetadataOptions"]["HttpTokens"] == "optional"
 
 
 def test_filter_by_account(index):

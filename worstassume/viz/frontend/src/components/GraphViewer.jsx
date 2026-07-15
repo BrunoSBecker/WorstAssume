@@ -347,9 +347,12 @@ function ControlsPanel({ cyRef, open, onToggle, nodeSize, setNodeSize, edgeOpaci
 // ─── Main component ────────────────────────────────────────────────────────────
 
 export default function GraphViewer({ nodeIds = [], pathSteps = [], onClose, onNodeIdsChange }) {
-  const { findings, entities } = useApp()
+  const { findings, entities, ensureEntities } = useApp()
   const entitiesRef = useRef(null)
   useEffect(() => { entitiesRef.current = entities }, [entities])
+  // Entities are loaded lazily app-wide; ensure they're available so node
+  // clicks can be enriched with full entity data (esp. in path mode).
+  useEffect(() => { ensureEntities?.().catch(() => {}) }, [ensureEntities])
   const containerRef = useRef(null)
   const cyRef = useRef(null)
   const panelRef = useRef(null)

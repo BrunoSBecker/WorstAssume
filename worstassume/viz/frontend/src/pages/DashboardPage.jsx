@@ -127,9 +127,10 @@ export default function DashboardPage() {
   const resourceCount  = stats?.resources  ?? allEntities.filter(e => e.node_type === 'resource').length
   const policyCount    = stats?.policies   ?? allEntities.filter(e => e.node_type === 'policy').length
 
-  // Derived subtitles for metric cards
-  const roleCount = allEntities.filter(e => e.principal_type === 'role').length
-  const userCount = allEntities.filter(e => e.principal_type === 'user').length
+  // Derived subtitles for metric cards — prefer fast /api/stats counts,
+  // fall back to the entity array only if it happens to be loaded.
+  const roleCount = stats?.roles ?? allEntities.filter(e => e.principal_type === 'role').length
+  const userCount = stats?.users ?? allEntities.filter(e => e.principal_type === 'user').length
 
   return (
     <div className="page-content" style={{ display: 'flex', flexDirection: 'column', overflow: 'hidden' }}>

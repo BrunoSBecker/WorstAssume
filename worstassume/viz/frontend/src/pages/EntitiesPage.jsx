@@ -1,15 +1,16 @@
-import { useState, useMemo } from 'react'
+import { useState, useMemo, useEffect } from 'react'
+import { useQuery } from '@tanstack/react-query'
 import { useApp } from '../context/AppContext'
+import { api } from '../api'
 import GraphViewer from '../components/GraphViewer'
-import EntityDetailPanel, { computeRisk } from '../components/EntityDetailPanel'
-import Paginator, { usePagination } from '../components/Paginator'
+import EntityDetailPanel from '../components/EntityDetailPanel'
+import Paginator from '../components/Paginator'
 
 // ─── Helpers ──────────────────────────────────────────────
 const TYPE_ICON = { role: '⚙', user: '👤', group: '👥', policy: '📄', resource: '☁', account: '🔷' }
 const TYPE_TABS = ['All', 'Roles', 'Users', 'Groups', 'Policies', 'Resources']
 const TYPE_MAP = { Roles: 'role', Users: 'user', Groups: 'group', Policies: 'policy', Resources: 'resource' }
 const RISK_FILTERS = ['All Risk', 'Critical', 'High', 'Clean']
-const RISK_RANK = { CRITICAL: 0, HIGH: 1, MEDIUM: 2, LOW: 3, CLEAN: 4 }
 const SERVICE_FILTERS = ['All', 'ec2', 's3', 'lambda', 'ecs', 'vpc']
 const SERVICE_LABEL = { ec2: 'EC2', s3: 'S3', lambda: 'Lambda', ecs: 'ECS', vpc: 'VPC' }
 const _selectStyle = (active) => ({
@@ -20,39 +21,9 @@ const _selectStyle = (active) => ({
   fontFamily: 'IBM Plex Mono, monospace', cursor: 'pointer', outline: 'none',
 })
 
-/**
- * Detect AWS-managed principals (service-linked roles, SSO reserved) and
- * AWS-managed policies.  Used by the Managed filter toggle.
- */
-function isAwsManaged(entity) {
-  const arn = entity.arn || ''
-  const label = entity.label || ''
-  const type = entity.principal_type || entity.node_type
-  // AWS service-linked roles and SSO reserved roles
-  if (type === 'role') {
-    if (arn.includes('/aws-service-role/')) return true
-    if (label.startsWith('AWSServiceRole')) return true
-    if (arn.includes('/AWSReservedSSO_')) return true
-    if (arn.includes('/aws-reserved/sso.amazonaws.com/')) return true
-  }
-  // AWS-managed policies (arn:aws:iam::aws:policy/...)
-  if (type === 'policy' || entity.node_type === 'policy') {
-    if (entity.policy_type === 'aws_managed') return true
-    if (arn.includes(':aws:policy/')) return true
-  }
-  return false
-}
-
-/**
- * IAM-style prefix matching for the permission filter.
- * Typing "iam:Assume" matches iam:AssumeRole, iam:AssumeRoleWithSAML, etc.
- * Trailing wildcards (iam:*) are stripped and matched as prefixes.
- */
-function matchesPermission(actions, query) {
-  if (!query || !actions || actions.length === 0) return false
-  const q = query.toLowerCase().replace(/\*$/, '')
-  return actions.some(a => typeof a === 'string' && a.toLowerCase().startsWith(q))
-}
+// NOTE: AWS-managed detection and IAM-style permission matching now happen
+// server-side in the EntityIndex (see /api/entities). The page just forwards
+// filter state as query params.
 
 
 // ─── Permission Multi-Select Dropdown ─────────────────────────
@@ -141,9 +112,6 @@ function PermissionMultiSelect({ selected, onChange, options, query, onQueryChan
 }
 
 
-// entityRisk is now computeRisk imported from EntityDetailPanel
-const entityRisk = computeRisk
-
 const RISK_STYLE = {
   CRITICAL: { bg: 'rgba(192,48,48,.12)', color: 'var(--red-hi)', border: 'rgba(192,48,48,.3)' },
   HIGH: { bg: 'rgba(217,124,20,.12)', color: 'var(--amber-hi)', border: 'rgba(217,124,20,.3)' },
@@ -204,13 +172,22 @@ function MiniPill({ variant = 'dim', children }) {
 }
 
 
+// Map the tri-state Managed/Custom checkboxes to the server `managed` param
+function managedParam(showManaged, showCustom) {
+  if (showManaged && showCustom) return 'all'
+  if (showManaged && !showCustom) return 'only'
+  if (!showManaged && showCustom) return 'exclude'
+  return 'none'
+}
+
 // ─── Main Page ────────────────────────────────────────────
 export default function EntitiesPage() {
-  const { entities, findings, accounts } = useApp()
+  const { findings } = useApp()
 
   const [tab, setTab] = useState('All')
   const [riskFilter, setRiskFilter] = useState('All Risk')
   const [search, setSearch] = useState('')
+  const [debouncedSearch, setDebouncedSearch] = useState('')
   const [selected, setSelected] = useState(null)
   const [serviceFilter, setServiceFilter] = useState('All')
   const [selectedPerms, setSelectedPerms] = useState([])
@@ -218,86 +195,62 @@ export default function EntitiesPage() {
   const [accountFilter, setAccountFilter] = useState('')
   const [showManaged, setShowManaged] = useState(true)
   const [showCustom, setShowCustom]   = useState(true)
+  const [page, setPage] = useState(1)
   const [graphIds, setGraphIds] = useState([])
   const [showGraph, setShowGraph] = useState(false)
 
   const PAGE_SIZE = 50
 
-  const all = entities || []
+  // Debounce free-text search so we don't fire a request per keystroke
+  useEffect(() => {
+    const t = setTimeout(() => setDebouncedSearch(search), 250)
+    return () => clearTimeout(t)
+  }, [search])
 
-  const filtered = useMemo(() => {
-    let arr = all
-    // Type tab
-    if (tab !== 'All') arr = arr.filter(e => (e.principal_type || e.node_type) === TYPE_MAP[tab])
-    // Risk
-    if (riskFilter !== 'All Risk') {
-      const rf = riskFilter.toUpperCase()
-      arr = arr.filter(e => entityRisk(e, findings) === rf)
-    }
-    // Text search
-    if (search.trim()) {
-      const q = search.toLowerCase()
-      arr = arr.filter(e =>
-        (e.label || '').toLowerCase().includes(q) ||
-        (e.arn || '').toLowerCase().includes(q) ||
-        (e.account_id || '').includes(q)
-      )
-    }
-    // Service filter (resources only)
-    if (serviceFilter !== 'All') {
-      arr = arr.filter(e => e.service === serviceFilter)
-    }
-    // Permission filter — entities must match ALL selected permissions
-    if (selectedPerms.length > 0) {
-      arr = arr.filter(e => {
-        if (!e.actions || e.actions.length === 0) return false
-        return selectedPerms.every(perm => matchesPermission(e.actions, perm))
-      })
-    }
-    // Account filter
-    if (accountFilter) {
-      arr = arr.filter(e => e.account_id === accountFilter)
-    }
-    // AWS Managed / Custom flags
-    if (showManaged && !showCustom) {
-      arr = arr.filter(e => isAwsManaged(e))
-    } else if (!showManaged && showCustom) {
-      arr = arr.filter(e => !isAwsManaged(e))
-    } else if (!showManaged && !showCustom) {
-      arr = []
-    }
-    return [...arr].sort((a, b) =>
-      (RISK_RANK[entityRisk(a, findings)] ?? 5) - (RISK_RANK[entityRisk(b, findings)] ?? 5)
-    )
-  }, [all, tab, riskFilter, search, serviceFilter, selectedPerms, accountFilter, showManaged, showCustom, findings])
+  // Server-side filter params
+  const filterParams = useMemo(() => ({
+    type: tab === 'All' ? '' : (TYPE_MAP[tab] || ''),
+    risk: riskFilter === 'All Risk' ? '' : riskFilter.toUpperCase(),
+    q: debouncedSearch.trim(),
+    service: serviceFilter === 'All' ? '' : serviceFilter,
+    permissions: selectedPerms.join(','),
+    account_id: accountFilter,
+    managed: managedParam(showManaged, showCustom),
+  }), [tab, riskFilter, debouncedSearch, serviceFilter, selectedPerms, accountFilter, showManaged, showCustom])
 
-  const { page, totalPages, pageItems, goTo } = usePagination(filtered, PAGE_SIZE)
+  // Reset to page 1 whenever any filter changes
+  useEffect(() => { setPage(1) }, [filterParams])
 
-  const counts = useMemo(() => {
-    const c = { All: all.length }
-    for (const t of Object.keys(TYPE_MAP))
-      c[t] = all.filter(e => (e.principal_type || e.node_type) === TYPE_MAP[t]).length
-    return c
-  }, [all])
+  // Facets: type counts, account list, action vocabulary (fetched once)
+  const { data: meta } = useQuery({
+    queryKey: ['entities-meta'],
+    queryFn: () => api.entitiesMeta(),
+    staleTime: 60_000,
+  })
 
-  // Unique account IDs for the account dropdown, with labels from /api/accounts
-  const uniqueAccounts = useMemo(() => {
-    const ids = new Set()
-    for (const e of all) { if (e.account_id) ids.add(e.account_id) }
-    return [...ids].map(id => {
-      const acct = (accounts || []).find(a => a.account_id === id)
-      return { id, name: acct?.account_name || id }
-    })
-  }, [all, accounts])
+  // Paginated, server-filtered entity page.
+  // NOTE: deliberately NOT using keepPreviousData — otherwise the previous
+  // tab/filter's rows linger on screen during the refetch, which looks like
+  // the list never refreshes. We show a loading spinner instead.
+  const { data: pageData, isFetching, isError } = useQuery({
+    queryKey: [
+      'entities',
+      filterParams.type, filterParams.risk, filterParams.q,
+      filterParams.service, filterParams.permissions,
+      filterParams.account_id, filterParams.managed, page,
+    ],
+    queryFn: () => api.entities({ ...filterParams, page, page_size: PAGE_SIZE }),
+  })
 
-  // All unique actions across every entity — populates the permission multi-select
-  const allUniqueActions = useMemo(() => {
-    const set = new Set()
-    for (const e of all) {
-      if (e.actions) e.actions.forEach(a => typeof a === 'string' && set.add(a))
-    }
-    return [...set].sort()
-  }, [all])
+  const pageItems = pageData?.items || []
+  const total = pageData?.total || 0
+  const totalPages = Math.max(1, Math.ceil(total / PAGE_SIZE))
+
+  const counts = meta?.counts || {}
+  const tabCount = (t) => t === 'All' ? (counts.All || 0) : (counts[TYPE_MAP[t]] || 0)
+
+  const uniqueAccounts = meta?.accounts || []
+  const allUniqueActions = meta?.actions || []
 
   const activeFilterCount = (serviceFilter !== 'All' ? 1 : 0)
     + (selectedPerms.length > 0 ? 1 : 0) + (accountFilter ? 1 : 0)
@@ -307,6 +260,8 @@ export default function EntitiesPage() {
     setServiceFilter('All'); setSelectedPerms([]); setPermQuery(''); setAccountFilter('')
     setShowManaged(true); setShowCustom(true)
   }
+
+  function goTo(n) { setPage(Math.max(1, Math.min(totalPages, n))) }
 
   function handleViewGraph(entity) {
     const nid = entity.node_id || entity.arn
@@ -362,7 +317,7 @@ export default function EntitiesPage() {
                   border: `1px solid ${tab === t ? 'rgba(217,124,20,.3)' : 'var(--border2)'}`,
                   borderRadius: '2px', padding: '0 5px', fontSize: '9px',
                   color: tab === t ? 'var(--amber)' : 'var(--text-faint)',
-                }}>{counts[t] || 0}</span>
+                }}>{tabCount(t)}</span>
               </button>
             ))}
           </div>
@@ -445,8 +400,15 @@ export default function EntitiesPage() {
           </div>
 
           {/* Table */}
-          <div style={{ flex: 1, overflowY: 'auto' }}>
-            {filtered.length === 0 ? (
+          <div style={{ flex: 1, overflowY: 'auto', position: 'relative' }}>
+            {isError ? (
+              <div className="empty-state"><div className="empty-state-icon">⚠</div><div className="empty-state-title">Failed to load entities</div></div>
+            ) : isFetching ? (
+              <div className="full-loading" style={{ height: '100%' }}>
+                <div className="spinner-ring" style={{ width: 28, height: 28, borderWidth: 3 }} />
+                <div className="full-loading-text">LOADING ENTITIES…</div>
+              </div>
+            ) : total === 0 ? (
               <div className="empty-state"><div className="empty-state-icon">🔍</div><div className="empty-state-title">No entities match</div></div>
             ) : (
               <table style={{ width: '100%', borderCollapse: 'collapse' }}>
@@ -468,9 +430,9 @@ export default function EntitiesPage() {
                     const arn = e.arn || e.node_id || ''
                     const nm = e.label || arn.split('/').pop() || arn
                     const acct = e.account_id || '—'
-                    const risk = entityRisk(e, findings)
+                    const risk = e.risk || 'CLEAN'
                     const isSel = selected && (selected.arn === arn || selected.node_id === arn)
-                    const paths = (findings || []).filter(f => !f.suppressed && (f.entity_arn === arn || f.principal_arn === arn)).length
+                    const paths = e.paths || 0
 
                     return (
                       <tr key={e.node_id || i} onClick={() => setSelected(isSel ? null : e)}
@@ -518,7 +480,7 @@ export default function EntitiesPage() {
               </table>
             )}
           </div>
-          <Paginator page={page} totalPages={totalPages} total={filtered.length} pageSize={PAGE_SIZE} goTo={goTo} label="entities" />
+          <Paginator page={page} totalPages={totalPages} total={total} pageSize={PAGE_SIZE} goTo={goTo} label="entities" />
         </div>
       </div>
 

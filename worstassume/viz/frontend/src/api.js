@@ -22,7 +22,15 @@ export const api = {
   // Account / stats / entities
   accounts:    ()       => get('/api/accounts'),
   stats:       ()       => get('/api/stats'),
-  entities:    ()       => get('/api/entities'),
+  // No params → legacy full grouped dump (report export, graph enrichment).
+  // With params (page_size>0) → { items, total, page, page_size }.
+  entities: (params = {}) => {
+    const qs = new URLSearchParams(
+      Object.entries(params).filter(([, v]) => v !== undefined && v !== null && v !== '')
+    ).toString()
+    return get(`/api/entities${qs ? '?' + qs : ''}`)
+  },
+  entitiesMeta: () => get('/api/entities/meta'),
   crossLinks:  ()       => get('/api/cross-account-links'),
   principals:  (q = '') => get(`/api/principals?q=${encodeURIComponent(q)}`),
 

@@ -7,6 +7,8 @@ export function AppProvider({ children }) {
   // The graph canvas imperative handle (replaces cyRef)
   const graphRef  = useRef(null)
   const abortRef  = useRef(false)
+  // De-dupes concurrent lazy full-entity loads (report export / graph enrichment)
+  const entitiesPromiseRef = useRef(null)
 
   // ── Server data ──────────────────────────────────────────────────────
   const [entities,    setEntities]    = useState(null)
@@ -41,22 +43,17 @@ export function AppProvider({ children }) {
   }
 
   // ── Load initial data ────────────────────────────────────────────────
+  // NOTE: the full entity catalogue is NO LONGER loaded here — it is huge for
+  // large orgs and blocked the whole app. The Entities page fetches paginated,
+  // server-filtered data directly. Consumers that still need the full array
+  // (report export, graph enrichment) call ensureEntities() lazily.
   useEffect(() => {
     const loadData = async () => {
       try {
-        // Load everything in parallel — findings needed by Dashboard & Accounts on first render
-        const [entsRaw, accts, findingsData] = await Promise.all([
-          api.entities(),
+        const [accts, findingsData] = await Promise.all([
           api.accounts(),
           api.securityFindings(),
         ])
-        const flat = [
-          ...(entsRaw?.principals || []),
-          ...(entsRaw?.policies   || []),
-          ...(entsRaw?.resources  || []),
-          ...(entsRaw?.accounts   || []),
-        ]
-        setEntities(flat)
         setAccounts(Array.isArray(accts) ? accts : (accts?.accounts || []))
         setFindings(Array.isArray(findingsData) ? findingsData : (findingsData?.findings || []))
         // Stats is fast (DB counts only)
@@ -69,6 +66,29 @@ export function AppProvider({ children }) {
     }
     loadData()
   }, [])
+
+  // ── Lazy full-entity loader (report export / graph enrichment) ────────
+  const ensureEntities = useCallback(async () => {
+    if (entities) return entities
+    if (entitiesPromiseRef.current) return entitiesPromiseRef.current
+    const p = (async () => {
+      const raw = await api.entities()  // no params → legacy full grouped dump
+      const flat = [
+        ...(raw?.principals || []),
+        ...(raw?.policies   || []),
+        ...(raw?.resources  || []),
+        ...(raw?.accounts   || []),
+      ]
+      setEntities(flat)
+      return flat
+    })()
+    entitiesPromiseRef.current = p
+    try {
+      return await p
+    } finally {
+      entitiesPromiseRef.current = null
+    }
+  }, [entities])
 
   // ── Identity / target setters ────────────────────────────────────────
   const setIdentity = useCallback((nodeData) => {
@@ -92,7 +112,7 @@ export function AppProvider({ children }) {
   return (
     <AppContext.Provider value={{
       graphRef, abortRef,
-      entities, accounts, findings, chains, stats, dataLoading,
+      entities, ensureEntities, accounts, findings, chains, stats, dataLoading,
       identity, setIdentity,
       target, setTarget,
       pathActive, setPathActive,

@@ -168,7 +168,7 @@ const FORMATS = [
 ]
 
 export default function ReportModal({ onClose }) {
-  const { findings, entities, accounts } = useApp()
+  const { findings, entities, ensureEntities, accounts } = useApp()
 
   const [format,      setFormat]      = useState('html')
   const [sections,    setSections]    = useState({ summary: true, findings: true, paths: true, inventory: true })
@@ -182,6 +182,12 @@ export default function ReportModal({ onClose }) {
       .then(d => setAttackPaths(Array.isArray(d) ? d : []))
       .catch(e => setPathsErr(e.message))
   }, [])
+
+  // The entity inventory is no longer eagerly loaded app-wide — fetch it lazily
+  // when the report modal opens so the inventory section can be exported.
+  useEffect(() => {
+    ensureEntities().catch(() => {})
+  }, [ensureEntities])
 
   const allFindings = (findings || []).filter(f => !f.suppressed)
   const allEntities = entities || []

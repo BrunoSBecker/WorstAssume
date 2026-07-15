@@ -6,6 +6,7 @@ import json
 import logging
 import os
 import threading
+import time
 from pathlib import Path
 
 import networkx as nx
@@ -91,12 +92,19 @@ def _get_store(db) -> GraphStore:
 
 
 def _prewarm_cache() -> None:
-    """Build the GraphStore once at server startup so the first request is instant."""
+    """Build the GraphStore + entity index once at startup so first requests are instant."""
     db = get_session()
     try:
         _CACHE.get(db, _db_path())
     except Exception as exc:
         log.warning("[graph_cache] pre-warm failed (non-fatal): %s", exc)
+    finally:
+        db.close()
+    db = get_session()
+    try:
+        _ENTITY_CACHE.get(db, _db_path())
+    except Exception as exc:
+        log.warning("[entity_index] pre-warm failed (non-fatal): %s", exc)
     finally:
         db.close()
 
@@ -191,6 +199,9 @@ async def api_stats():
             "principals": db.query(Principal).count(),
             "resources":  db.query(Resource).count(),
             "policies":   db.query(Policy).count(),
+            "roles":      db.query(Principal).filter_by(principal_type="role").count(),
+            "users":      db.query(Principal).filter_by(principal_type="user").count(),
+            "groups":     db.query(Principal).filter_by(principal_type="group").count(),
         })
     finally:
         db.close()
@@ -215,104 +226,372 @@ def _collect_policy_actions(policy) -> list[str]:
     return sorted(actions)
 
 
-# ── API: entity catalogue (paginated) ─────────────────────────────────────────
+# ── Entity catalogue index (cached, filterable, paginated) ────────────────────
+#
+# The entity catalogue is expensive to assemble for large orgs (10k+ principals,
+# each requiring policy-document parsing).  We build it ONCE into a process-level
+# index and invalidate it on SQLite mtime change (same strategy as GraphCache).
+# All filtering / sorting / pagination then runs over the in-memory index.
 
-@app.get("/api/entities")
-async def api_entities(page: int = 1, page_size: int = 0):
+_RISK_RANK = {"CRITICAL": 0, "HIGH": 1, "MEDIUM": 2, "LOW": 3, "CLEAN": 4}
+
+
+def _compute_entity_risk(actions: list[str], trusts: list[str], severities: set[str]) -> str:
+    """Server-side mirror of the frontend computeRisk() heuristic."""
+    if "CRITICAL" in severities:
+        return "CRITICAL"
+    if "HIGH" in severities:
+        return "HIGH"
+    if any(a == "*" or a == "iam:*" for a in actions):
+        return "CRITICAL"
+    if any(a.startswith("iam:") or a.startswith("sts:") for a in actions):
+        return "HIGH"
+    if any(a.startswith(("lambda:", "ec2:", "s3:")) for a in actions):
+        return "MEDIUM"
+    if any("*" in p for p in trusts):
+        return "HIGH"
+    if actions:
+        return "LOW"
+    return "CLEAN"
+
+
+def _entity_is_aws_managed(item: dict) -> bool:
+    """Server-side mirror of the frontend isAwsManaged() heuristic."""
+    arn = item.get("arn") or ""
+    label = item.get("label") or ""
+    typ = item.get("principal_type") or item.get("node_type")
+    if typ == "role":
+        if "/aws-service-role/" in arn:
+            return True
+        if label.startswith("AWSServiceRole"):
+            return True
+        if "/AWSReservedSSO_" in arn:
+            return True
+        if "/aws-reserved/sso.amazonaws.com/" in arn:
+            return True
+    if item.get("node_type") == "policy":
+        if item.get("policy_type") == "aws_managed":
+            return True
+        if ":aws:policy/" in arn:
+            return True
+    return False
+
+
+def _permission_matches(actions_lc: list[str], query: str) -> bool:
+    """IAM-style prefix match: 'iam:*' / 'iam:Assume' → startswith after stripping '*'."""
+    q = query.lower().rstrip("*")
+    if not q:
+        return False
+    return any(a.startswith(q) for a in actions_lc)
+
+
+class EntityIndex:
     """
-    Flat catalogue of all principals, policies, resources and accounts.
-    page_size=0 (default) returns everything for backwards compat.
+    Pre-built, cached catalogue of all entities with derived risk/paths/managed
+    flags.  Supports server-side filtering, sorting and pagination.
     """
-    db = get_session()
-    try:
+
+    def __init__(self) -> None:
+        self.entries: list[dict] = []      # each: {"public": dict, filter fields...}
+        self.type_counts: dict[str, int] = {}
+        self.accounts: list[dict] = []     # [{"id","name"}]
+        self.actions_vocab: list[str] = []
+        self.built_at: float = 0.0
+
+    # ── Build ────────────────────────────────────────────────────────────────
+    @classmethod
+    def build(cls, db) -> "EntityIndex":
         from sqlalchemy.orm import joinedload as jl
+
+        idx = cls()
         principals = (
             db.query(Principal)
             .options(jl(Principal.policies), jl(Principal.account))
             .all()
         )
-        policies   = (
+        policies = (
             db.query(Policy)
             .options(jl(Policy.account), jl(Policy.principals))
             .all()
         )
-        resources  = (
+        resources = (
             db.query(Resource)
-            .options(jl(Resource.account), jl(Resource.execution_role))
+            .options(
+                jl(Resource.account),
+                jl(Resource.execution_role).joinedload(Principal.policies),
+            )
             .all()
         )
-        accounts   = db.query(Account).all()
+        accounts = db.query(Account).all()
+
+        # Non-suppressed finding severities per entity ARN
+        sev_map: dict[str, set[str]] = {}
+        path_count: dict[str, int] = {}
+        for f in db.query(SecurityFinding).all():
+            if f.suppressed:
+                continue
+            sev_map.setdefault(f.entity_arn, set()).add(f.severity)
+            path_count[f.entity_arn] = path_count.get(f.entity_arn, 0) + 1
+
+        vocab: set[str] = set()
+        acct_names: dict[str, str] = {a.account_id: (a.account_name or a.account_id) for a in accounts}
+
+        def _add(public: dict, type_key: str, actions: list[str], trusts: list[str]) -> None:
+            arn = public.get("arn") or ""
+            severities = sev_map.get(arn, set())
+            risk = _compute_entity_risk(actions, trusts, severities)
+            paths = path_count.get(arn, 0)
+            public["risk"] = risk
+            public["paths"] = paths
+            managed = _entity_is_aws_managed(public)
+            for a in actions:
+                if isinstance(a, str):
+                    vocab.add(a)
+            acct = public.get("account_id")
+            search = " ".join(
+                x for x in (public.get("label"), arn, acct) if x
+            ).lower()
+            idx.entries.append({
+                "public": public,
+                "type_key": type_key,
+                "account_id": acct,
+                "service": public.get("service"),
+                "managed": managed,
+                "risk": risk,
+                "risk_rank": _RISK_RANK.get(risk, 5),
+                "search": search,
+                "actions_lc": [a.lower() for a in actions if isinstance(a, str)],
+            })
+
+        for a in accounts:
+            _add({
+                "node_id": f"account:{a.account_id}",
+                "label": a.account_name or a.account_id,
+                "account_id": a.account_id,
+                "node_type": "account",
+            }, "account", [], [])
+
+        for p in principals:
+            actions = _collect_principal_actions(p)
+            trusts = _extract_trust_principals(p)
+            _add({
+                "node_id": f"principal:{p.arn}",
+                "label": p.name,
+                "arn": p.arn,
+                "principal_type": p.principal_type,
+                "account_id": p.account.account_id if p.account else None,
+                "node_type": "principal",
+                "actions": actions,
+                "trust_principals": trusts,
+                "policies": [
+                    {"name": pol.name, "arn": pol.arn, "type": pol.policy_type}
+                    for pol in p.policies
+                ],
+            }, p.principal_type or "role", actions, trusts)
+
+        for pol in policies:
+            actions = _collect_policy_actions(pol)
+            _add({
+                "node_id": f"policy:{pol.arn}",
+                "label": pol.name,
+                "arn": pol.arn,
+                "policy_type": pol.policy_type,
+                "account_id": pol.account.account_id if pol.account else None,
+                "node_type": "policy",
+                "actions": actions,
+                "attached_principals": [
+                    {"name": pr.name, "arn": pr.arn, "type": pr.principal_type}
+                    for pr in pol.principals
+                ],
+            }, "policy", actions, [])
+
+        for r in resources:
+            actions = _collect_principal_actions(r.execution_role) if r.execution_role else []
+            _add({
+                "node_id": f"resource:{r.arn}",
+                "label": r.name or r.arn,
+                "arn": r.arn,
+                "service": r.service,
+                "resource_type": r.resource_type,
+                "region": r.region,
+                "account_id": r.account.account_id if r.account else None,
+                "node_type": "resource",
+                "execution_role": {
+                    "name": r.execution_role.name,
+                    "arn": r.execution_role.arn,
+                } if r.execution_role else None,
+                "actions": actions,
+            }, "resource", actions, [])
+
+        idx.type_counts = {
+            "All": len(idx.entries),
+            "role": sum(1 for e in idx.entries if e["type_key"] == "role"),
+            "user": sum(1 for e in idx.entries if e["type_key"] == "user"),
+            "group": sum(1 for e in idx.entries if e["type_key"] == "group"),
+            "policy": sum(1 for e in idx.entries if e["type_key"] == "policy"),
+            "resource": sum(1 for e in idx.entries if e["type_key"] == "resource"),
+        }
+        idx.accounts = [{"id": aid, "name": name} for aid, name in sorted(acct_names.items())]
+        idx.actions_vocab = sorted(vocab)
+        idx.built_at = time.time()
+        log.info("[entity_index] built — %d entries, %d actions", len(idx.entries), len(idx.actions_vocab))
+        return idx
+
+    def is_stale(self, db_path: str | None) -> bool:
+        if not self.built_at:
+            return True
+        if not db_path:
+            return False
+        try:
+            return os.path.getmtime(db_path) > self.built_at
+        except OSError:
+            return True
+
+    # ── Query ────────────────────────────────────────────────────────────────
+    def query(
+        self,
+        *,
+        type_key: str = "",
+        risk: str = "",
+        q: str = "",
+        service: str = "",
+        permissions: list[str] | None = None,
+        account_id: str = "",
+        managed: str = "all",
+        page: int = 1,
+        page_size: int = 50,
+    ) -> dict:
+        permissions = permissions or []
+        q = (q or "").strip().lower()
+        rows = self.entries
+
+        if type_key:
+            rows = [e for e in rows if e["type_key"] == type_key]
+        if risk:
+            ru = risk.upper()
+            rows = [e for e in rows if e["risk"] == ru]
+        if q:
+            rows = [e for e in rows if q in e["search"]]
+        if service and service != "All":
+            rows = [e for e in rows if e["service"] == service]
+        if account_id:
+            rows = [e for e in rows if e["account_id"] == account_id]
+        if permissions:
+            rows = [
+                e for e in rows
+                if e["actions_lc"]
+                and all(_permission_matches(e["actions_lc"], p) for p in permissions)
+            ]
+        if managed == "only":
+            rows = [e for e in rows if e["managed"]]
+        elif managed == "exclude":
+            rows = [e for e in rows if not e["managed"]]
+        elif managed == "none":
+            rows = []
+
+        rows = sorted(rows, key=lambda e: e["risk_rank"])
+        total = len(rows)
+        if page_size > 0:
+            start = max(0, (page - 1) * page_size)
+            rows = rows[start:start + page_size]
+        return {
+            "items": [e["public"] for e in rows],
+            "total": total,
+            "page": page,
+            "page_size": page_size,
+        }
+
+    def grouped(self) -> dict:
+        """Legacy full-dump shape: {accounts, principals, policies, resources, total}."""
+        out = {"accounts": [], "principals": [], "policies": [], "resources": []}
+        for e in self.entries:
+            nt = e["public"].get("node_type")
+            if nt == "account":
+                out["accounts"].append(e["public"])
+            elif nt == "principal":
+                out["principals"].append(e["public"])
+            elif nt == "policy":
+                out["policies"].append(e["public"])
+            elif nt == "resource":
+                out["resources"].append(e["public"])
+        out["total"] = len(self.entries)
+        return out
+
+
+class _EntityIndexCache:
+    def __init__(self) -> None:
+        self._idx: EntityIndex | None = None
+        self._lock = threading.Lock()
+
+    def get(self, db, db_path: str | None) -> EntityIndex:
+        with self._lock:
+            if self._idx is None or self._idx.is_stale(db_path):
+                log.info("[entity_index] building…")
+                self._idx = EntityIndex.build(db)
+        return self._idx
+
+
+_ENTITY_CACHE = _EntityIndexCache()
+
+
+def _get_entity_index(db) -> EntityIndex:
+    return _ENTITY_CACHE.get(db, _db_path())
+
+
+# ── API: entity catalogue (paginated, filtered) ──────────────────────────────
+
+@app.get("/api/entities")
+async def api_entities(
+    page: int = 1,
+    page_size: int = 0,
+    type: str = "",
+    risk: str = "",
+    q: str = "",
+    service: str = "",
+    permissions: str = "",
+    account_id: str = "",
+    managed: str = "all",
+):
+    """
+    Entity catalogue with server-side filtering, sorting and pagination.
+
+    page_size=0 (default) returns the legacy full grouped dump
+    ({accounts, principals, policies, resources, total}) for backwards compat
+    (report export, graph enrichment).  page_size>0 returns
+    {items, total, page, page_size}.
+    """
+    db = get_session()
+    try:
+        idx = _get_entity_index(db)
+        if page_size <= 0:
+            return JSONResponse(content=idx.grouped())
+        perms = [p.strip() for p in permissions.split(",") if p.strip()]
+        result = idx.query(
+            type_key=type,
+            risk=risk,
+            q=q,
+            service=service,
+            permissions=perms,
+            account_id=account_id,
+            managed=managed,
+            page=page,
+            page_size=page_size,
+        )
+        return JSONResponse(content=result)
+    finally:
+        db.close()
+
+
+@app.get("/api/entities/meta")
+async def api_entities_meta():
+    """Lightweight facets for the Entities filter UI: type counts, accounts, action vocab."""
+    db = get_session()
+    try:
+        idx = _get_entity_index(db)
         return JSONResponse(content={
-            "accounts": [
-                {
-                    "node_id": f"account:{a.account_id}",
-                    "label": a.account_name or a.account_id,
-                    "account_id": a.account_id,
-                    "node_type": "account",
-                }
-                for a in accounts
-            ],
-            "principals": [
-                {
-                    "node_id": f"principal:{p.arn}",
-                    "label": p.name,
-                    "arn": p.arn,
-                    "principal_type": p.principal_type,
-                    "account_id": p.account.account_id if p.account else None,
-                    "node_type": "principal",
-                    "actions": _collect_principal_actions(p),
-                    "trust_principals": _extract_trust_principals(p),
-                    # Full policy list for sidebar
-                    "policies": [
-                        {
-                            "name": pol.name,
-                            "arn": pol.arn,
-                            "type": pol.policy_type,
-                        }
-                        for pol in p.policies
-                    ],
-                }
-                for p in principals
-            ],
-            "policies": [
-                {
-                    "node_id": f"policy:{pol.arn}",
-                    "label": pol.name,
-                    "arn": pol.arn,
-                    "policy_type": pol.policy_type,
-                    "account_id": pol.account.account_id if pol.account else None,
-                    "node_type": "policy",
-                    # Actions granted by this policy
-                    "actions": _collect_policy_actions(pol),
-                    # Principals that have this policy attached
-                    "attached_principals": [
-                        {"name": pr.name, "arn": pr.arn, "type": pr.principal_type}
-                        for pr in pol.principals
-                    ],
-                }
-                for pol in policies
-            ],
-            "resources": [
-                {
-                    "node_id": f"resource:{r.arn}",
-                    "label": r.name or r.arn,
-                    "arn": r.arn,
-                    "service": r.service,
-                    "resource_type": r.resource_type,
-                    "region": r.region,
-                    "account_id": r.account.account_id if r.account else None,
-                    "node_type": "resource",
-                    # Execution role if present
-                    "execution_role": {
-                        "name": r.execution_role.name,
-                        "arn": r.execution_role.arn,
-                    } if r.execution_role else None,
-                    # Actions from execution role policies
-                    "actions": _collect_principal_actions(r.execution_role) if r.execution_role else [],
-                }
-                for r in resources
-            ],
-            "total": len(principals) + len(policies) + len(resources) + len(accounts),
+            "counts": idx.type_counts,
+            "accounts": idx.accounts,
+            "actions": idx.actions_vocab,
         })
     finally:
         db.close()

@@ -33,6 +33,11 @@ export function AppProvider({ children }) {
   // ── Active page ──────────────────────────────────────────────────────
   const [page, setPage] = useState('dashboard')
 
+  // ── Cross-page "focus in graph" (Assessment → Graph linkage) ─────────
+  const [graphFocusIds,    setGraphFocusIds]    = useState([])
+  const [graphFocusNodeId, setGraphFocusNodeId] = useState(null)
+  const [graphFocusOpen,   setGraphFocusOpen]   = useState(false)
+
   function showToast(msg, ms = 4000) {
     setToastMsg(msg)
     setTimeout(() => setToastMsg(null), ms)
@@ -109,6 +114,20 @@ export function AppProvider({ children }) {
     abortRef.current = true
   }, [])
 
+  // ── Focus a node in the global graph viewer from any page ────────────
+  const focusNode = useCallback((nodeId) => {
+    if (!nodeId) return
+    setGraphFocusIds(prev => prev.includes(nodeId) ? prev : [...prev, nodeId])
+    setGraphFocusNodeId(nodeId)
+    setGraphFocusOpen(true)
+  }, [])
+
+  const closeFocusGraph = useCallback(() => {
+    setGraphFocusOpen(false)
+    setGraphFocusIds([])
+    setGraphFocusNodeId(null)
+  }, [])
+
   return (
     <AppContext.Provider value={{
       graphRef, abortRef,
@@ -126,6 +145,8 @@ export function AppProvider({ children }) {
       page, setPage,
       setFindings, setChains, setStats,
       cancelPrivesc,
+      graphFocusIds, graphFocusNodeId, graphFocusOpen,
+      setGraphFocusIds, focusNode, closeFocusGraph,
     }}>
       {children}
     </AppContext.Provider>

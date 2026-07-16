@@ -7,6 +7,21 @@ const SEV_ORDER = { CRITICAL: 0, HIGH: 1, MEDIUM: 2, LOW: 3 }
 
 function sevClass(sev) { return (sev || '').toLowerCase() }
 
+// Map a finding's entity ARN to its graph node id (principal:/policy:/resource:)
+function findingNodeId(finding) {
+  const arn = (finding.entity_arn || '').trim()
+  if (!arn) return null
+  if (arn.includes(':policy/')) return `policy:${arn}`
+  if (arn.includes(':role/') || arn.includes(':user/') || arn.includes(':group/') || arn.includes(':assumed-role/')) {
+    return `principal:${arn}`
+  }
+  const t = (finding.entity_type || '').toLowerCase()
+  if (t === 'policy') return `policy:${arn}`
+  if (['principal', 'role', 'user', 'group'].includes(t)) return `principal:${arn}`
+  // Fallback: service resources (s3, ec2, lambda, …)
+  return `resource:${arn}`
+}
+
 // ─── Run modal ────────────────────────────────────────────────────────────────
 
 function RunModal({ accounts, onRun, onClose }) {
@@ -75,6 +90,7 @@ function RunModal({ accounts, onRun, onClose }) {
 // ─── Finding row ──────────────────────────────────────────────────────────────
 
 function FindingRow({ finding, expanded, onToggle }) {
+  const { focusNode } = useApp()
   const sev  = sevClass(finding.severity)
   const name = finding.entity_name || (finding.entity_arn || '').split('/').pop()
   const arn  = finding.entity_arn || ''
@@ -125,6 +141,14 @@ function FindingRow({ finding, expanded, onToggle }) {
           {finding.created_at && (
             <div style={{ fontSize:'10px', color:'var(--text-faint)', marginTop:'6px' }}>
               Detected: {new Date(finding.created_at).toLocaleString()}
+            </div>
+          )}
+          {arn && (
+            <div style={{ marginTop:'10px' }}>
+              <button className="btn secondary sm"
+                onClick={(e) => { e.stopPropagation(); focusNode(findingNodeId(finding)) }}>
+                ⬡ Find in graph
+              </button>
             </div>
           )}
         </div>

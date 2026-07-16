@@ -5,6 +5,7 @@ import EntitiesPage   from './pages/EntitiesPage'
 import AssessmentPage from './pages/AssessmentPage'
 import PrivEscPage    from './pages/PrivEscPage'
 import ReportModal    from './components/ReportModal'
+import GraphViewer    from './components/GraphViewer'
 import { useState } from 'react'
 
 // Logo mark SVG
@@ -26,7 +27,10 @@ const PAGE_LABELS = {
 }
 
 function AppShell() {
-  const { page, setPage, findings, dataLoading, toastMsg } = useApp()
+  const {
+    page, setPage, findings, dataLoading, toastMsg,
+    graphFocusOpen, graphFocusIds, graphFocusNodeId, setGraphFocusIds, closeFocusGraph,
+  } = useApp()
   const [showReport, setShowReport] = useState(false)
 
   const allFindings  = findings || []
@@ -74,6 +78,16 @@ function AppShell() {
         {page === 'assessment' && <AssessmentPage />}
         {page === 'privesc'    && <PrivEscPage />}
       </div>
+
+      {/* Global graph viewer — opened via focusNode() from any page (e.g. findings) */}
+      {graphFocusOpen && (
+        <GraphViewer
+          nodeIds={graphFocusIds}
+          focusNodeId={graphFocusNodeId}
+          onNodeIdsChange={setGraphFocusIds}
+          onClose={closeFocusGraph}
+        />
+      )}
     </div>
   )
 }

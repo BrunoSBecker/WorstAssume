@@ -371,7 +371,7 @@ function ControlsPanel({ cyRef, open, onToggle, nodeSize, setNodeSize, edgeOpaci
 
 // ─── Main component ────────────────────────────────────────────────────────────
 
-export default function GraphViewer({ nodeIds = [], pathSteps = [], onClose, onNodeIdsChange }) {
+export default function GraphViewer({ nodeIds = [], pathSteps = [], focusNodeId = null, onClose, onNodeIdsChange }) {
   const { findings, entities, ensureEntities } = useApp()
   const entitiesRef = useRef(null)
   useEffect(() => { entitiesRef.current = entities }, [entities])
@@ -381,6 +381,8 @@ export default function GraphViewer({ nodeIds = [], pathSteps = [], onClose, onN
   const containerRef = useRef(null)
   const cyRef = useRef(null)
   const panelRef = useRef(null)
+  // Nodes the user explicitly removed — never re-added on subsequent loads
+  const removedRef = useRef(new Set())
 
   const isPathMode = pathSteps?.length > 0
 
@@ -395,6 +397,7 @@ export default function GraphViewer({ nodeIds = [], pathSteps = [], onClose, onN
   const [edgeCount, setEdgeCount] = useState(0)
   const [nodeSize, setNodeSize] = useState(26)
   const [edgeOpacity, setEdgeOpacity] = useState(isPathMode ? 1 : 0.6)
+  const [ctxMenu, setCtxMenu] = useState(null)  // { x, y, id, label }
 
   // ── Resize ─────────────────────────────────────────────────────────────────
 
@@ -428,10 +431,19 @@ export default function GraphViewer({ nodeIds = [], pathSteps = [], onClose, onN
       const rich = entitiesRef.current?.find(e => e.arn === d.arn)
       setSelected(rich || dataToEntity(d))
       setSelectedId(d.id)
+      setCtxMenu(null)
     })
     cy.on('tap', evt => {
       if (evt.target === cy) { setSelected(null); setSelectedId(null) }
+      setCtxMenu(null)
     })
+    // Right-click a node → contextual removal menu
+    cy.on('cxttap', 'node', evt => {
+      const d = evt.target.data()
+      const pos = evt.renderedPosition || { x: 0, y: 0 }
+      setCtxMenu({ x: pos.x, y: pos.y, id: d.id, label: d.fullLabel || d.label })
+    })
+    cy.on('pan zoom', () => setCtxMenu(null))
     cyRef.current = cy
     return () => cy.destroy()
   }, [])
@@ -450,12 +462,13 @@ export default function GraphViewer({ nodeIds = [], pathSteps = [], onClose, onN
           const data = await api.node(qid)
             ; (data.nodes || []).forEach(n => {
               const nid = n.id || n.node_id
-              if (!nid || existingIds.has(nid)) return
+              if (!nid || existingIds.has(nid) || removedRef.current.has(nid)) return
               existingIds.add(nid)
               toAdd.push({ group: 'nodes', data: makeData(n) })
             })
             ; (data.edges || []).forEach(e => {
               if (!e.source || !e.target) return
+              if (removedRef.current.has(e.source) || removedRef.current.has(e.target)) return
               const eid = e.id || `${e.source}--${e.edge_type || 'edge'}--${e.target}`
               if (!existingIds.has(eid)) {
                 existingIds.add(eid)
@@ -503,6 +516,51 @@ export default function GraphViewer({ nodeIds = [], pathSteps = [], onClose, onN
     setSelected(null); setSelectedId(null)
   }
 
+  // Remove a single node (and its edges). Optionally also drop neighbors that
+  // become orphaned (no remaining edges). Removed ids are remembered so they
+  // are not re-added on subsequent neighbor loads, and pruned from parent seeds.
+  function removeNode(id, alsoOrphans = false) {
+    const cy = cyRef.current
+    if (!cy || !id) return
+    const node = cy.getElementById(id)
+    if (!node || node.empty()) return
+
+    const removedIds = [id]
+    if (alsoOrphans) {
+      node.neighborhood('node').forEach(nb => {
+        // degree === 1 means its only connection is the node being removed
+        if (nb.degree(false) <= 1) removedIds.push(nb.id())
+      })
+    }
+    let coll = cy.collection()
+    removedIds.forEach(rid => {
+      removedRef.current.add(rid)
+      coll = coll.union(cy.getElementById(rid))
+    })
+    cy.remove(coll)
+
+    setNodeCount(cy.nodes().length)
+    setEdgeCount(cy.edges().length)
+    setCtxMenu(null)
+    if (removedIds.includes(selectedId)) { setSelected(null); setSelectedId(null) }
+    onNodeIdsChange?.(nodeIds.filter(x => !removedIds.includes(x)))
+  }
+
+  // Focus mode — center + select a seeded node once it has loaded
+  useEffect(() => {
+    const cy = cyRef.current
+    if (!cy || !focusNodeId) return
+    const node = cy.getElementById(focusNodeId)
+    if (!node || node.empty()) return
+    cy.nodes().unselect()
+    node.select()
+    cy.center(node)
+    const d = node.data()
+    const rich = entitiesRef.current?.find(e => e.arn === d.arn)
+    setSelected(rich || dataToEntity(d))
+    setSelectedId(d.id)
+  }, [focusNodeId, nodeCount])
+
   // ── Sync slider changes ────────────────────────────────────────────────────
 
   useEffect(() => {
@@ -546,10 +604,15 @@ export default function GraphViewer({ nodeIds = [], pathSteps = [], onClose, onN
             onViewGraph={null}
           />
           {!isPathMode && (
-            <div style={{ padding: '8px 12px', borderTop: '1px solid var(--border)' }}>
-              <button className="btn primary sm" style={{ width: '100%', justifyContent: 'center' }}
+            <div style={{ padding: '8px 12px', borderTop: '1px solid var(--border)', display: 'flex', gap: '8px' }}>
+              <button className="btn primary sm" style={{ flex: 1, justifyContent: 'center' }}
                 onClick={() => expandNode(selectedId)}>
                 ⊕ Expand neighbors
+              </button>
+              <button className="btn secondary sm" title="Remove this node from the graph"
+                style={{ justifyContent: 'center', color: 'var(--red-hi)', borderColor: 'rgba(192,48,48,.3)' }}
+                onClick={() => removeNode(selectedId)}>
+                ✕ Remove
               </button>
             </div>
           )}
@@ -613,9 +676,33 @@ export default function GraphViewer({ nodeIds = [], pathSteps = [], onClose, onN
                 cy.elements().remove()
                 setNodeCount(0); setEdgeCount(0)
                 setSelected(null); setSelectedId(null)
+                setCtxMenu(null)
                 onNodeIdsChange?.([])
               }}
             />
+            {/* Node context menu (right-click) */}
+            {ctxMenu && (
+              <div style={{
+                position: 'absolute', left: ctxMenu.x, top: ctxMenu.y, zIndex: 30,
+                background: 'var(--bg1)', border: '1px solid var(--border2)', borderRadius: '4px',
+                boxShadow: '0 6px 20px rgba(0,0,0,0.55)', minWidth: '180px', overflow: 'hidden',
+              }}>
+                <div style={{ padding: '6px 10px', fontSize: '10px', color: 'var(--text-faint)', borderBottom: '1px solid var(--border)', whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>
+                  {ctxMenu.label}
+                </div>
+                {[
+                  { label: '✕  Remove node', fn: () => removeNode(ctxMenu.id) },
+                  { label: '✕  Remove node + orphaned', fn: () => removeNode(ctxMenu.id, true) },
+                ].map(({ label, fn }) => (
+                  <button key={label} onClick={fn}
+                    style={{ display: 'block', width: '100%', textAlign: 'left', padding: '7px 10px', background: 'transparent', border: 'none', color: 'var(--text)', fontSize: '11px', cursor: 'pointer', fontFamily: 'inherit' }}
+                    onMouseEnter={e => { e.currentTarget.style.background = 'var(--bg3)' }}
+                    onMouseLeave={e => { e.currentTarget.style.background = 'transparent' }}>
+                    {label}
+                  </button>
+                ))}
+              </div>
+            )}
             {/* Legend */}
             <div style={{ position: 'absolute', bottom: 12, left: 12, zIndex: 10, display: 'flex', flexDirection: 'column', gap: 4 }}>
               {isPathMode && (
@@ -641,7 +728,7 @@ export default function GraphViewer({ nodeIds = [], pathSteps = [], onClose, onN
 
         <div className="slideover-footer">
           <span style={{ fontSize: '10px', color: 'var(--text-faint)', marginRight: 'auto' }}>
-            {isPathMode ? 'Amber dashed = attack step · Click node to inspect' : 'Click to inspect · Drag nodes · Scroll to zoom · ⛭ Controls'}
+            {isPathMode ? 'Amber dashed = attack step · Click node to inspect' : 'Click to inspect · Right-click to remove · Drag nodes · Scroll to zoom · ⛭ Controls'}
           </span>
           <button className="btn secondary sm" onClick={onClose}>Close</button>
         </div>

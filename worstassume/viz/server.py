@@ -91,6 +91,53 @@ def _get_store(db) -> GraphStore:
     return _CACHE.get(db, _db_path())
 
 
+# ── ReverseIndexCache — process-level reverse engine for the Threat Model ────
+
+class ReverseIndexCache:
+    """Holds a NeighborContext + ReverseIndex, rebuilt when the SQLite file changes.
+
+    The Threat Model page expands one node at a time, so every click hits this.
+    Loading the context and normalizing every principal's policy statements is
+    the expensive part and is entirely DB-state dependent, so it is done once
+    per DB change and shared across requests.
+    """
+
+    def __init__(self) -> None:
+        self._index = None
+        self._built_at: float = 0.0
+        self._lock = threading.Lock()
+
+    def get(self, db, db_path: str | None = None):
+        from worstassume.core.attack_graph import NeighborContext
+        from worstassume.core.reverse_index import ReverseIndex
+        with self._lock:
+            stale = self._index is None
+            if not stale and db_path:
+                try:
+                    stale = os.path.getmtime(db_path) > self._built_at
+                except OSError:
+                    stale = True
+            if stale:
+                log.info("[reverse_index_cache] building reverse index…")
+                started = time.time()
+                ctx = NeighborContext(db)
+                known = {a.account_id for a in db.query(Account).all()}
+                self._index = ReverseIndex(ctx, known_accounts=known or None)
+                self._built_at = time.time()
+                log.info(
+                    "[reverse_index_cache] ready in %.2fs: %d principals, %d resources",
+                    self._built_at - started, len(ctx.principals), len(ctx.resources),
+                )
+        return self._index
+
+
+_REVERSE_CACHE = ReverseIndexCache()
+
+
+def _get_reverse_index(db):
+    return _REVERSE_CACHE.get(db, _db_path())
+
+
 def _prewarm_cache() -> None:
     """Build the GraphStore + entity index once at startup so first requests are instant."""
     db = get_session()
@@ -105,6 +152,13 @@ def _prewarm_cache() -> None:
         _ENTITY_CACHE.get(db, _db_path())
     except Exception as exc:
         log.warning("[entity_index] pre-warm failed (non-fatal): %s", exc)
+    finally:
+        db.close()
+    db = get_session()
+    try:
+        _get_reverse_index(db)
+    except Exception as exc:
+        log.warning("[reverse_index] pre-warm failed (non-fatal): %s", exc)
     finally:
         db.close()
 
@@ -293,6 +347,9 @@ class EntityIndex:
 
     def __init__(self) -> None:
         self.entries: list[dict] = []      # each: {"public": dict, filter fields...}
+        # arn -> {"risk", "paths"}; lets other endpoints colour a node without
+        # rescanning the catalogue.
+        self.risk_by_arn: dict[str, dict] = {}
         self.type_counts: dict[str, int] = {}
         self.accounts: list[dict] = []     # [{"id","name"}]
         self.actions_vocab: list[str] = []
@@ -343,6 +400,8 @@ class EntityIndex:
             paths = path_count.get(arn, 0)
             public["risk"] = risk
             public["paths"] = paths
+            if arn:
+                idx.risk_by_arn[arn] = {"risk": risk, "paths": paths}
             managed = _entity_is_aws_managed(public)
             for a in actions:
                 if isinstance(a, str):
@@ -467,7 +526,11 @@ class EntityIndex:
         q = (q or "").strip().lower()
         rows = self.entries
 
-        if type_key:
+        if type_key == "principal":
+            # Pseudo-key: everything that can act. The Threat Model asset picker
+            # wants "principals vs resources", not one IAM type at a time.
+            rows = [e for e in rows if e["type_key"] in ("role", "user", "group")]
+        elif type_key:
             rows = [e for e in rows if e["type_key"] == type_key]
         if risk:
             ru = risk.upper()
@@ -1186,10 +1249,15 @@ async def api_node_detail(node_id: str):
                     policies_out.append({
                         "name": pol.name, "arn": pol.arn,
                         "type": pol.policy_type, "actions": sorted(set(actions)),
+                        # The document is what the sidebar's Permissions tab
+                        # shows; the ORM object is already loaded here, so this
+                        # costs no extra query.
+                        "document": doc,
                     })
                 data["policies"]        = policies_out
                 data["all_actions"]     = sorted(all_actions)
                 data["trust_principals"] = _extract_trust_principals(principal)
+                data["metadata"]        = principal.extra
 
         if node_id.startswith("policy:"):
             arn = node_id[len("policy:"):]
@@ -1266,18 +1334,31 @@ def _ap_step(s: AttackPathStep) -> dict:
 @app.get("/api/attack-paths")
 async def api_attack_paths(
     from_arn:       str | None = None,
+    involves_arn:   str | None = None,
     severity:       str | None = None,
     objective_type: str | None = None,
     account_id:     str | None = None,
+    limit:          int = 0,
 ):
     """
     Return persisted AttackPath rows with optional filters.
 
     Query params:
         from_arn        – filter by starting identity ARN
+        involves_arn    – ARN appearing anywhere in the path (start, any step
+                          actor, or any step target)
         severity        – CRITICAL / HIGH / MEDIUM
         objective_type  – permission / resource / principal
         account_id      – AWS account ID string
+        limit           – cap the number of rows (0 = no cap). A busy identity
+                          can sit on thousands of paths, which no sidebar wants
+                          to render; callers that page ask for limit+1 to detect
+                          that there are more.
+
+    `from_arn` alone only matches paths that *start* at the ARN, which is rarely
+    what you want when inspecting an entity — a path can traverse or terminate at
+    it. `involves_arn` joins the step table for that. It has no index, but the
+    table is small enough that a scan is not worth one.
     """
     db = get_session()
     try:
@@ -1288,12 +1369,22 @@ async def api_attack_paths(
                 query = query.filter(AttackPath.account_id == acct.id)
         if from_arn:
             query = query.filter(AttackPath.from_principal_arn == from_arn)
+        if involves_arn:
+            from sqlalchemy import or_ as _or
+            from worstassume.db.models import AttackPathStep as _Step
+            query = (query.outerjoin(_Step)
+                     .filter(_or(AttackPath.from_principal_arn == involves_arn,
+                                 _Step.actor_arn == involves_arn,
+                                 _Step.target_arn == involves_arn))
+                     .distinct())
         if severity:
             query = query.filter(AttackPath.severity == severity.upper())
         if objective_type:
             query = query.filter(AttackPath.objective_type == objective_type.lower())
-        paths = query.order_by(AttackPath.severity, AttackPath.total_hops).all()
-        return JSONResponse(content=[_ap_summary(ap) for ap in paths])
+        query = query.order_by(AttackPath.severity, AttackPath.total_hops)
+        if limit > 0:
+            query = query.limit(limit)
+        return JSONResponse(content=[_ap_summary(ap) for ap in query.all()])
     finally:
         db.close()
 
@@ -1384,3 +1475,255 @@ async def api_attack_paths_run(body: dict = Body(default={})):
     loop    = asyncio.get_event_loop()
     results = await loop.run_in_executor(None, _run)
     return JSONResponse(content=results)
+
+
+# ── API: threat model — interactive inbound access graph ─────────────────────
+#
+# The page walks the access graph backwards one hop at a time: pick an asset,
+# see everything that can reach it, expand one of those, repeat. So the API is
+# a cheap per-node neighbour lookup plus CRUD for saving the graph the analyst
+# builds — not a batch scan.
+
+from dataclasses import asdict  # noqa: E402
+from datetime import datetime  # noqa: E402
+
+from worstassume.core.reverse_index import DEFAULT_LIMIT, FAMILIES  # noqa: E402
+from worstassume.db.models import ThreatModelGraph  # noqa: E402
+
+_NODE_ID_PREFIXES = ("principal", "resource", "policy", "account", "external")
+
+#: Hard ceiling on one expansion, whatever the client asks for.
+_MAX_NEIGHBOR_LIMIT = 500
+
+#: Multi-hop auto-expand is bounded separately: each visited node costs one
+#: inbound_page(), so without a ceiling a single request could occupy a worker
+#: for minutes. These keep the worst case in the tens of seconds.
+_MAX_HOPS = 5
+_MULTIHOP_PER_NODE_LIMIT = 50
+_MULTIHOP_NODE_BUDGET = 150
+
+#: A saved graph is analyst-authored, so it is small in practice; the cap only
+#: stops a malformed or runaway client filling the DB with one row.
+_MAX_GRAPH_JSON_BYTES = 4 * 1024 * 1024
+_MAX_NOTES_CHARS = 4000
+
+
+def _strip_prefix(raw: str) -> str:
+    head, _, rest = raw.partition(":")
+    return rest if head in _NODE_ID_PREFIXES and rest else raw
+
+
+def _enrich_node(node: dict, risk_by_arn: dict) -> dict:
+    """Attach the catalogue's risk label / finding count to a graph node."""
+    extra = risk_by_arn.get(node.get("arn")) or {}
+    node["risk"] = extra.get("risk")
+    node["findings"] = extra.get("paths", 0)
+    return node
+
+
+def _parse_families(raw: str) -> tuple[str, ...]:
+    if not raw:
+        return FAMILIES
+    picked = tuple(f.strip() for f in raw.split(",") if f.strip() in FAMILIES)
+    return picked or FAMILIES
+
+
+@app.get("/api/threat-model/neighbors")
+async def api_threat_model_neighbors(
+    arn: str = "",
+    limit: int = DEFAULT_LIMIT,
+    offset: int = 0,
+    families: str = "",
+    hops: int = 1,
+):
+    """Everything that can reach *arn* in one inbound hop, ranked and paged.
+
+    Query params:
+        arn      : target ARN (a prefixed graph node id is also accepted)
+        limit    : page size, capped at 500 (0 = no cap, still capped at 500)
+        offset   : page offset into the ranked list
+        families : comma-separated subset of identity_policy,resource_policy,abuse
+        hops     : >1 auto-expands breadth-first and returns one page per node
+
+    Response: {node, neighbors[], total_found, returned, truncated} for a single
+    hop, or {pages: [...]} when hops > 1.
+    """
+    target = _strip_prefix(arn or "")
+    if not target:
+        return JSONResponse(content={"error": "arn is required"}, status_code=422)
+
+    limit = _MAX_NEIGHBOR_LIMIT if limit <= 0 else min(limit, _MAX_NEIGHBOR_LIMIT)
+    offset = max(0, offset)
+    fams = _parse_families(families)
+
+    def _run() -> dict:
+        db = get_session()
+        try:
+            index = _get_reverse_index(db)
+            risk_by_arn = _get_entity_index(db).risk_by_arn
+
+            def _pack(page) -> dict:
+                out = asdict(page)
+                _enrich_node(out["node"], risk_by_arn)
+                for n in out["neighbors"]:
+                    _enrich_node(n, risk_by_arn)
+                return out
+
+            if hops > 1:
+                pages = index.expand_hops(
+                    target, hops=min(hops, _MAX_HOPS), families=fams,
+                    per_node_limit=min(limit, _MULTIHOP_PER_NODE_LIMIT),
+                    node_budget=_MULTIHOP_NODE_BUDGET,
+                )
+                return {"pages": [_pack(p) for p in pages]}
+
+            return _pack(
+                index.inbound_page(target, families=fams, limit=limit, offset=offset)
+            )
+        finally:
+            db.close()
+
+    # Expansion is CPU-bound; keep it off the event loop so one deep auto-expand
+    # cannot stall every other request.
+    import asyncio
+    loop = asyncio.get_event_loop()
+    return JSONResponse(content=await loop.run_in_executor(None, _run))
+
+
+# ── API: saved threat-model graphs ───────────────────────────────────────────
+
+def _tmg_summary(g: ThreatModelGraph) -> dict:
+    return {
+        "id":         g.id,
+        "name":       g.name,
+        "root_arn":   g.root_arn,
+        "account_id": g.account_id,
+        "node_count": g.node_count,
+        "edge_count": g.edge_count,
+        "notes":      g.notes,
+        "created_at": str(g.created_at) if g.created_at else None,
+        "updated_at": str(g.updated_at) if g.updated_at else None,
+    }
+
+
+def _tmg_full(g: ThreatModelGraph) -> dict:
+    d = _tmg_summary(g)
+    d["graph"] = g.graph or {"nodes": [], "edges": [], "expanded": [], "removed": []}
+    return d
+
+
+def _apply_graph_payload(g: ThreatModelGraph, body: dict) -> None:
+    """Apply a create/update payload. Only fields present in *body* are touched.
+
+    In particular a rename must not clobber the canvas, so the graph blob is
+    replaced only when the caller actually sends one.
+    """
+    def _text(key, current, limit):
+        """A string field from the body, or the current value. Type-checked so a
+        non-string reaches the caller as a 422 rather than blowing up on slice."""
+        if key not in body:
+            return current
+        v = body[key]
+        if v is None:
+            return current
+        if not isinstance(v, str):
+            raise ValueError(f"{key} must be a string")
+        return v[:limit]
+
+    g.name = _text("name", g.name, 256) or "Untitled graph"
+    g.root_arn = _strip_prefix(_text("root_arn", g.root_arn, 2048) or "") or None
+    g.account_id = _text("account_id", g.account_id, 32)
+    g.notes = _text("notes", g.notes, _MAX_NOTES_CHARS)
+    if "graph" in body:
+        graph = body.get("graph") or {}
+        if not isinstance(graph, dict):
+            raise ValueError("graph must be an object")
+        try:
+            blob = json.dumps(graph)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(f"graph is not serialisable: {exc}") from exc
+        if len(blob.encode("utf-8")) > _MAX_GRAPH_JSON_BYTES:
+            raise ValueError("graph is too large to save")
+        g.node_count = len(graph.get("nodes") or [])
+        g.edge_count = len(graph.get("edges") or [])
+        g.graph_json = blob
+
+
+@app.post("/api/threat-model/graphs")
+async def api_tmg_create(body: dict = Body(default={})):
+    """Save a new threat-model graph.
+
+    Body: {name, root_arn?, account_id?, notes?, graph: {nodes, edges,
+    expanded, removed}}. The graph blob is stored verbatim.
+    """
+    name = body.get("name")
+    if not isinstance(name, str) or not name.strip():
+        return JSONResponse(content={"error": "name is required"}, status_code=422)
+    db = get_session()
+    try:
+        g = ThreatModelGraph()
+        try:
+            _apply_graph_payload(g, body)
+        except ValueError as exc:
+            return JSONResponse(content={"error": str(exc)}, status_code=422)
+        db.add(g)
+        db.commit()
+        return JSONResponse(content=_tmg_full(g))
+    finally:
+        db.close()
+
+
+@app.get("/api/threat-model/graphs")
+async def api_tmg_list():
+    """List saved threat-model graphs, most recently updated first."""
+    db = get_session()
+    try:
+        rows = (db.query(ThreatModelGraph)
+                .order_by(ThreatModelGraph.updated_at.desc()).all())
+        return JSONResponse(content=[_tmg_summary(g) for g in rows])
+    finally:
+        db.close()
+
+
+@app.get("/api/threat-model/graphs/{graph_id}")
+async def api_tmg_detail(graph_id: int):
+    db = get_session()
+    try:
+        g = db.get(ThreatModelGraph, graph_id)
+        if g is None:
+            return JSONResponse(content={"error": "not found"}, status_code=404)
+        return JSONResponse(content=_tmg_full(g))
+    finally:
+        db.close()
+
+
+@app.put("/api/threat-model/graphs/{graph_id}")
+async def api_tmg_update(graph_id: int, body: dict = Body(default={})):
+    """Overwrite a saved graph (rename and/or replace the canvas)."""
+    db = get_session()
+    try:
+        g = db.get(ThreatModelGraph, graph_id)
+        if g is None:
+            return JSONResponse(content={"error": "not found"}, status_code=404)
+        try:
+            _apply_graph_payload(g, body)
+        except ValueError as exc:
+            return JSONResponse(content={"error": str(exc)}, status_code=422)
+        g.updated_at = datetime.utcnow()
+        db.commit()
+        return JSONResponse(content=_tmg_full(g))
+    finally:
+        db.close()
+
+
+@app.delete("/api/threat-model/graphs/{graph_id}")
+async def api_tmg_delete(graph_id: int):
+    db = get_session()
+    try:
+        g = db.get(ThreatModelGraph, graph_id)
+        if g is not None:
+            db.delete(g)
+            db.commit()
+        return JSONResponse(content={"ok": True})
+    finally:
+        db.close()

@@ -4,6 +4,7 @@ import DashboardPage  from './pages/DashboardPage'
 import EntitiesPage   from './pages/EntitiesPage'
 import AssessmentPage from './pages/AssessmentPage'
 import PrivEscPage    from './pages/PrivEscPage'
+import ThreatModelPage from './pages/ThreatModelPage'
 import ReportModal    from './components/ReportModal'
 import GraphViewer    from './components/GraphViewer'
 import { useState } from 'react'
@@ -24,6 +25,7 @@ const PAGE_LABELS = {
   entities:   'Entities',
   assessment: 'Assessment',
   privesc:    'PrivEsc',
+  threatmodel: 'Threat Model',
 }
 
 function AppShell() {
@@ -77,6 +79,7 @@ function AppShell() {
         {page === 'entities'   && <EntitiesPage />}
         {page === 'assessment' && <AssessmentPage />}
         {page === 'privesc'    && <PrivEscPage />}
+        {page === 'threatmodel' && <ThreatModelPage />}
       </div>
 
       {/* Global graph viewer — opened via focusNode() from any page (e.g. findings) */}

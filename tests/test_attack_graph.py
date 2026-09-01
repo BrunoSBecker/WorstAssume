@@ -469,17 +469,29 @@ class TestImdsEdge:
         exec_role = _make_role(db_session, account_a, "InstanceRole", [])
         _make_ec2_resource(db_session, account_a, "i-imdsv1", role=exec_role,
                            http_tokens="optional")
-        attacker = _make_role(db_session, account_a, "attacker", [])
+        # Reaching IMDS needs code execution on the box, so the attacker must
+        # hold one of the landing actions.
+        attacker = _make_role(db_session, account_a, "attacker", ["ssm:SendCommand"])
         G = _graph(db_session, account_a)
-        # Any principal should have an imds_steal edge to the instance exec role
-        imds_targets = {v for u, v, d in G.edges(data=True) if d["edge_type"] == "imds_steal"}
-        assert exec_role.arn in imds_targets
+        edges = _edges_between(G, attacker.arn, exec_role.arn)
+        assert any(e["edge_type"] == "imds_steal" for e in edges)
+
+    def test_imds_edge_requires_a_landing_action(self, db_session, account_a):
+        """A principal with no way onto the instance must not get an IMDS edge."""
+        exec_role = _make_role(db_session, account_a, "InstanceRole", [])
+        _make_ec2_resource(db_session, account_a, "i-imdsv1", role=exec_role,
+                           http_tokens="optional")
+        _make_role(db_session, account_a, "bystander", ["s3:GetObject"])
+        G = _graph(db_session, account_a)
+        imds_targets = {v for u, v, d in G.edges(data=True)
+                        if d["edge_type"] == "imds_steal"}
+        assert exec_role.arn not in imds_targets
 
     def test_imdsv2_instance_gets_no_imds_edge(self, db_session, account_a):
         exec_role = _make_role(db_session, account_a, "InstanceRole", [])
         _make_ec2_resource(db_session, account_a, "i-imdsv2", role=exec_role,
                            http_tokens="required")
-        _make_role(db_session, account_a, "attacker", [])
+        _make_role(db_session, account_a, "attacker", ["ssm:SendCommand"])
         G = _graph(db_session, account_a)
         imds_targets = {v for u, v, d in G.edges(data=True) if d["edge_type"] == "imds_steal"}
         assert exec_role.arn not in imds_targets

@@ -1,98 +1,31 @@
 /**
- * EntityDetailPanel — shared entity detail sidebar.
- * Used by both EntitiesPage (right column) and SigmaViewer (inline on node click).
+ * EntityDetailPanel — the entity inspector, used by every graph interaction.
+ *
+ * One component, four tabs, three call sites (GraphViewer, ThreatGraph,
+ * EntitiesPage). Callers own the width and supply their own footer actions;
+ * everything else is identical wherever it appears.
+ *
+ * Most of what the tabs show was already in the database and simply never
+ * surfaced: policy documents, raw trust policies, resource policies, and the
+ * full finding list rather than the first five.
  *
  * Props:
- *   entity     – entity object from /api/entities
- *   findings   – all security findings from context
+ *   entity     – entity object; may be a full /api/entities row or the sparse
+ *                shape dataToEntity() produces from a graph node
+ *   findings   – app-wide findings, used as a fallback before the per-entity
+ *                fetch resolves
  *   onClose    – () => void
- *   onViewGraph – (entity) => void   (optional)
+ *   actions    – [{label, onClick, variant, title}] rendered into .sb-actions
+ *   extraTabs  – [{id, label, count, render}] for caller-specific tabs
+ *   style      – escape hatch; width defaults to 100% so the wrapper decides
  */
+import { useMemo, useState } from 'react'
+import { useQuery } from '@tanstack/react-query'
+import { api } from '../api'
+import { MiniPill, RiskBadge, TypeIcon } from './EntityBits'
+import { computeRisk } from './entityStyles'
 
-// ─── Sub-components ───────────────────────────────────────────────────────────
-
-const TYPE_ICON = { role: '⚙', user: '👤', group: '👥', policy: '📄', resource: '☁', account: '🔷', principal: '⚙' }
-
-const RISK_STYLE = {
-  CRITICAL: { bg: 'rgba(192,48,48,.12)',  color: 'var(--red-hi)',    border: 'rgba(192,48,48,.3)' },
-  HIGH:     { bg: 'rgba(217,124,20,.12)', color: 'var(--amber-hi)',  border: 'rgba(217,124,20,.3)' },
-  MEDIUM:   { bg: 'rgba(184,160,32,.10)', color: 'var(--yellow-hi)', border: 'rgba(184,160,32,.25)' },
-  LOW:      { bg: 'rgba(42,112,128,.10)', color: 'var(--cyan-hi)',   border: 'rgba(42,112,128,.25)' },
-  CLEAN:    { bg: 'rgba(46,125,82,.10)',  color: 'var(--green-hi)',  border: 'rgba(46,125,82,.25)' },
-}
-
-function RiskBadge({ risk }) {
-  const s = RISK_STYLE[risk] || RISK_STYLE.LOW
-  return (
-    <span style={{
-      display: 'inline-flex', alignItems: 'center', padding: '2px 8px',
-      borderRadius: '2px', fontSize: '10px', fontWeight: 600,
-      letterSpacing: '0.06em', whiteSpace: 'nowrap',
-      background: s.bg, color: s.color, border: `1px solid ${s.border}`,
-    }}>{risk}</span>
-  )
-}
-
-function MiniPill({ variant = 'dim', children }) {
-  const S = {
-    service:   { bg: 'rgba(42,112,128,.1)',  color: 'var(--cyan-hi)',  border: '1px solid rgba(42,112,128,.25)' },
-    principal: { bg: 'rgba(217,124,20,.1)', color: 'var(--amber)',    border: '1px solid rgba(217,124,20,.25)' },
-    critical:  { bg: 'rgba(192,48,48,.12)', color: 'var(--red-hi)',   border: '1px solid rgba(192,48,48,.3)' },
-    high:      { bg: 'rgba(217,124,20,.12)',color: 'var(--amber-hi)', border: '1px solid rgba(217,124,20,.3)' },
-    medium:    { bg: 'rgba(184,160,32,.1)', color: 'var(--yellow-hi)',border: '1px solid rgba(184,160,32,.2)' },
-    dim:       { bg: 'var(--bg3)',           color: 'var(--text-dim)', border: '1px solid var(--border2)' },
-  }
-  const s = S[variant] || S.dim
-  return (
-    <span style={{
-      display: 'inline-flex', alignItems: 'center', padding: '2px 7px',
-      borderRadius: '2px', fontSize: '10px', fontWeight: 600,
-      letterSpacing: '0.06em', flexShrink: 0, whiteSpace: 'nowrap',
-      background: s.bg, color: s.color, border: s.border,
-    }}>{children}</span>
-  )
-}
-
-function TypeIcon({ type, size = 32 }) {
-  const S = {
-    role:     { bg: 'rgba(58,154,176,.1)',  border: 'rgba(58,154,176,.4)',  color: 'var(--cyan-hi)' },
-    user:     { bg: 'rgba(61,171,110,.1)',  border: 'rgba(61,171,110,.4)',  color: 'var(--green-hi)' },
-    group:    { bg: 'rgba(154,127,200,.1)', border: 'rgba(154,127,200,.4)', color: '#9a7fc8' },
-    policy:   { bg: 'rgba(200,120,176,.1)', border: 'rgba(200,120,176,.4)', color: '#c878b0' },
-    resource: { bg: 'rgba(217,124,20,.1)',  border: 'rgba(217,124,20,.4)',  color: 'var(--amber)' },
-    account:  { bg: 'rgba(90,96,112,.1)',   border: 'var(--border2)',       color: 'var(--text-dim)' },
-    principal:{ bg: 'rgba(58,154,176,.1)',  border: 'rgba(58,154,176,.4)',  color: 'var(--cyan-hi)' },
-  }
-  const s = S[type] || S.role
-  return (
-    <div style={{
-      width: size, height: size, borderRadius: '50%', flexShrink: 0,
-      display: 'flex', alignItems: 'center', justifyContent: 'center',
-      background: s.bg, border: `1.5px solid ${s.border}`, color: s.color,
-      fontSize: size * 0.44,
-    }}>{TYPE_ICON[type] || '?'}</div>
-  )
-}
-
-// ─── Risk computation ─────────────────────────────────────────────────────────
-
-export function computeRisk(entity, findings) {
-  const actions = entity.actions || []
-  const trusts  = entity.trust_principals || []
-  const arn     = entity.arn || entity.node_id || ''
-  const related = (findings || []).filter(f => !f.suppressed && (f.entity_arn === arn || f.principal_arn === arn))
-
-  if (related.some(f => f.severity === 'CRITICAL')) return 'CRITICAL'
-  if (related.some(f => f.severity === 'HIGH'))     return 'HIGH'
-  if (actions.some(a => a === '*' || a === 'iam:*')) return 'CRITICAL'
-  if (actions.some(a => a.startsWith('iam:') || a.startsWith('sts:'))) return 'HIGH'
-  if (actions.some(a => a.startsWith('lambda:') || a.startsWith('ec2:') || a.startsWith('s3:'))) return 'MEDIUM'
-  if (trusts.some(p => p.includes('*'))) return 'HIGH'
-  if (actions.length > 0) return 'LOW'
-  return 'CLEAN'
-}
-
-// ─── Section block wrapper ────────────────────────────────────────────────────
+// ─── Small shared pieces ──────────────────────────────────────────────────────
 
 function SbBlock({ label, children }) {
   return (
@@ -103,356 +36,560 @@ function SbBlock({ label, children }) {
   )
 }
 
-// ─── All permissions list (scrollable) ───────────────────────────────────────
-
-function PermissionsList({ actions, label = 'Permissions' }) {
-  if (!actions || actions.length === 0) return null
-
-  const wildcards = actions.filter(a => a === '*' || a.endsWith(':*'))
-  const iamSts    = actions.filter(a => !wildcards.includes(a) && (a.startsWith('iam:') || a.startsWith('sts:')))
-  const other     = actions.filter(a => !wildcards.includes(a) && !iamSts.includes(a))
-
-  const ordered   = [...wildcards, ...iamSts, ...other]
-
-  function chipStyle(a) {
-    if (wildcards.includes(a) || iamSts.includes(a)) return 'critical'
-    if (['lambda:', 'ec2:', 's3:', 'kms:', 'secretsmanager:'].some(p => a.startsWith(p))) return 'high'
-    return 'normal'
-  }
-
+function EmptyNote({ children }) {
   return (
-    <SbBlock label={`${label} (${actions.length})`}>
-      <div style={{
-        display: 'flex', flexWrap: 'wrap', gap: '4px', marginTop: '6px',
-        maxHeight: '160px', overflowY: 'auto', paddingRight: '4px',
-      }}>
-        {ordered.map((a, i) => (
-          <span key={i} className={`action-chip ${chipStyle(a)}`}>{a}</span>
-        ))}
-      </div>
-    </SbBlock>
+    <div style={{ padding: '18px 16px', fontSize: '11px', color: 'var(--text-faint)',
+                  lineHeight: 1.6 }}>{children}</div>
   )
 }
 
-// ─── Resource metadata (network / IMDS / service config) ─────────────────────
+/** Pretty-printed JSON with a copy button. */
+function JsonBlock({ value, maxHeight = 320 }) {
+  const [copied, setCopied] = useState(false)
+  const text = useMemo(() => {
+    if (value == null) return ''
+    return typeof value === 'string' ? value : JSON.stringify(value, null, 2)
+  }, [value])
+  if (!text) return null
+
+  function copy() {
+    navigator.clipboard?.writeText(text).then(() => {
+      setCopied(true)
+      setTimeout(() => setCopied(false), 1500)
+    }).catch(() => {})
+  }
+
+  return (
+    <div style={{ position: 'relative', marginTop: 6 }}>
+      <button className="btn secondary sm" onClick={copy}
+        style={{ position: 'absolute', top: 4, right: 4, zIndex: 2 }}>
+        {copied ? 'copied' : 'copy'}
+      </button>
+      <pre style={{
+        margin: 0, padding: '8px 10px', maxHeight, overflow: 'auto',
+        background: 'var(--bg)', border: '1px solid var(--border)',
+        borderRadius: 'var(--radius-sm)', fontSize: '10px', lineHeight: 1.55,
+        fontFamily: 'IBM Plex Mono, monospace', color: 'var(--text)',
+        whiteSpace: 'pre-wrap', wordBreak: 'break-word',
+      }}>{text}</pre>
+    </div>
+  )
+}
+
+function actionChipClass(a) {
+  if (a === '*' || a.endsWith(':*') || a.startsWith('iam:') || a.startsWith('sts:')) return 'critical'
+  if (['lambda:', 'ec2:', 's3:', 'kms:', 'secretsmanager:'].some(p => a.startsWith(p))) return 'high'
+  return 'normal'
+}
+
+/** Actions as chips, wildcards and IAM/STS first. No height cap — the tab owns
+ *  the scroll now, which was the point of giving permissions their own page. */
+function ActionChips({ actions }) {
+  const ordered = useMemo(() => {
+    const wild = actions.filter(a => a === '*' || a.endsWith(':*'))
+    const iam = actions.filter(a => !wild.includes(a) && (a.startsWith('iam:') || a.startsWith('sts:')))
+    const rest = actions.filter(a => !wild.includes(a) && !iam.includes(a))
+    return [...wild, ...iam, ...rest]
+  }, [actions])
+  if (!ordered.length) return null
+  return (
+    <div style={{ display: 'flex', flexWrap: 'wrap', gap: '4px', marginTop: '6px' }}>
+      {ordered.map((a, i) => <span key={i} className={`action-chip ${actionChipClass(a)}`}>{a}</span>)}
+    </div>
+  )
+}
 
 function humanizeKey(k) {
   return k.replace(/([A-Z])/g, ' $1').replace(/[_-]/g, ' ').replace(/\s+/g, ' ').trim()
     .replace(/\b\w/g, c => c.toUpperCase())
 }
 
-function ResourceMetadataBlock({ metadata }) {
-  if (!metadata || typeof metadata !== 'object' || Object.keys(metadata).length === 0) return null
+function ArnDisplay({ arn }) {
+  const parts = String(arn).split(':')
+  return (
+    <div className="sb-arn">
+      {parts.map((p, i) => (
+        <span key={i}>
+          {i > 0 && ':'}
+          <span style={{ color: i === 4 ? 'var(--amber)' : i === parts.length - 1 ? 'var(--white)' : undefined }}>{p}</span>
+        </span>
+      ))}
+    </div>
+  )
+}
 
-  const imds = metadata.MetadataOptions
+// ─── Tab: Overview ────────────────────────────────────────────────────────────
+
+function OverviewTab({ e, risk, findingCount }) {
+  const meta = e.metadata && typeof e.metadata === 'object' ? e.metadata : null
+  const imds = meta?.MetadataOptions
   const imdsWeak = imds && imds.HttpTokens && imds.HttpTokens !== 'required'
 
-  // Keys rendered specially or intentionally hidden (large blobs)
-  const skip = new Set(['MetadataOptions', 'security_groups', 'attaches_to_vpcs', 'policy', 'resource_policy'])
+  const skip = new Set(['MetadataOptions', 'security_groups', 'attaches_to_vpcs',
+                        'policy', 'resource_policy'])
   const rows = []
-  for (const [k, v] of Object.entries(metadata)) {
-    if (skip.has(k)) continue
-    if (v === null || v === undefined || v === '') continue
-    if (typeof v === 'object') continue
-    rows.push([humanizeKey(k), typeof v === 'boolean' ? (v ? 'yes' : 'no') : String(v)])
+  if (meta) {
+    for (const [k, v] of Object.entries(meta)) {
+      if (skip.has(k) || v === null || v === undefined || v === '') continue
+      if (typeof v === 'object') continue
+      rows.push([humanizeKey(k), typeof v === 'boolean' ? (v ? 'yes' : 'no') : String(v)])
+    }
   }
+  const sgs = Array.isArray(meta?.security_groups) ? meta.security_groups : null
+  const vpcs = Array.isArray(meta?.attaches_to_vpcs) ? meta.attaches_to_vpcs : null
 
-  const sgs = Array.isArray(metadata.security_groups) ? metadata.security_groups : null
-  const attaches = Array.isArray(metadata.attaches_to_vpcs) ? metadata.attaches_to_vpcs : null
-  const hasPolicy = metadata.policy || metadata.resource_policy
-
-  const rowStyle = { display: 'flex', gap: '8px', fontSize: '12px', fontFamily: 'IBM Plex Mono' }
-  const keyStyle = { color: 'var(--text-faint)', minWidth: '110px', flexShrink: 0 }
+  const rowStyle = { display: 'flex', gap: '8px', fontSize: '11px', marginTop: 4,
+                     fontFamily: 'IBM Plex Mono, monospace' }
+  const keyStyle = { color: 'var(--text-faint)', minWidth: '104px', flexShrink: 0 }
   const valStyle = { color: 'var(--text)', wordBreak: 'break-all' }
 
+  const facts = [
+    ['Account', e.account_id],
+    ['Type', e.principal_type || e.policy_type || e.resource_type],
+    ['Service', e.service],
+    ['Region', e.region],
+    ['Execution role', e.execution_role?.name],
+  ].filter(([, v]) => v)
+
+  const stats = [
+    ['Risk', <RiskBadge key="r" risk={risk} />],
+    ['Findings', findingCount],
+    e.policies?.length ? ['Policies', e.policies.length] : null,
+    e.actions?.length ? ['Actions', e.actions.length] : null,
+  ].filter(Boolean)
+
   return (
-    <SbBlock label="Configuration">
-      <div style={{ display: 'flex', flexDirection: 'column', gap: '4px', marginTop: '6px' }}>
-        {imds && (
-          <div style={{ ...rowStyle, alignItems: 'center' }}>
-            <span style={keyStyle}>IMDS</span>
-            <span style={{
-              padding: '1px 7px', borderRadius: '2px', fontSize: '10px', fontWeight: 600,
-              letterSpacing: '0.05em', whiteSpace: 'nowrap',
-              background: imdsWeak ? 'rgba(192,48,48,.12)' : 'rgba(46,125,82,.12)',
-              color: imdsWeak ? 'var(--red-hi)' : 'var(--green-hi)',
-              border: `1px solid ${imdsWeak ? 'rgba(192,48,48,.3)' : 'rgba(46,125,82,.25)'}`,
-            }}>{imdsWeak ? 'IMDSv1 allowed ⚠' : 'IMDSv2 required'}</span>
-          </div>
-        )}
-        {rows.map(([k, v]) => (
-          <div key={k} style={rowStyle}>
-            <span style={keyStyle}>{k}</span>
-            <span style={valStyle}>{v}</span>
+    <>
+      <SbBlock label="ARN"><ArnDisplay arn={e.arn || e.node_id || ''} /></SbBlock>
+
+      <div style={{ display: 'grid', gridTemplateColumns: `repeat(${stats.length}, 1fr)`,
+                    gap: 1, background: 'var(--border)',
+                    borderBottom: '1px solid var(--border)' }}>
+        {stats.map(([label, value]) => (
+          <div key={label} style={{ background: 'var(--bg1)', padding: '10px 12px' }}>
+            <div className="sb-label">{label}</div>
+            <div className="sb-value" style={{ marginTop: 3 }}>{value}</div>
           </div>
         ))}
-        {sgs && sgs.length > 0 && (
-          <div style={rowStyle}>
-            <span style={keyStyle}>Security Groups</span>
-            <span style={valStyle}>{sgs.join(', ')}</span>
-          </div>
-        )}
-        {attaches && attaches.length > 0 && (
-          <div style={rowStyle}>
-            <span style={keyStyle}>Attached VPCs</span>
-            <span style={valStyle}>{attaches.join(', ')}</span>
-          </div>
-        )}
-        {hasPolicy && (
-          <div style={rowStyle}>
-            <span style={keyStyle}>Resource Policy</span>
-            <span style={valStyle}>present</span>
-          </div>
-        )}
       </div>
-    </SbBlock>
+
+      {facts.length > 0 && (
+        <SbBlock label="Details">
+          {facts.map(([k, v]) => (
+            <div key={k} style={rowStyle}><span style={keyStyle}>{k}</span>
+              <span style={valStyle}>{v}</span></div>
+          ))}
+        </SbBlock>
+      )}
+
+      {(imds || rows.length > 0 || sgs || vpcs) && (
+        <SbBlock label="Configuration">
+          {imds && (
+            <div style={{ ...rowStyle, alignItems: 'center' }}>
+              <span style={keyStyle}>IMDS</span>
+              <MiniPill variant={imdsWeak ? 'critical' : 'dim'}>
+                {imdsWeak ? 'IMDSv1 allowed ⚠' : 'IMDSv2 required'}
+              </MiniPill>
+            </div>
+          )}
+          {rows.map(([k, v]) => (
+            <div key={k} style={rowStyle}><span style={keyStyle}>{k}</span>
+              <span style={valStyle}>{v}</span></div>
+          ))}
+          {sgs?.length > 0 && (
+            <div style={rowStyle}><span style={keyStyle}>Security Groups</span>
+              <span style={valStyle}>{sgs.join(', ')}</span></div>
+          )}
+          {vpcs?.length > 0 && (
+            <div style={rowStyle}><span style={keyStyle}>Attached VPCs</span>
+              <span style={valStyle}>{vpcs.join(', ')}</span></div>
+          )}
+        </SbBlock>
+      )}
+    </>
+  )
+}
+
+// ─── Tab: Permissions ─────────────────────────────────────────────────────────
+
+function PolicyRow({ policy }) {
+  const [open, setOpen] = useState(false)
+  const inline = policy.type === 'inline'
+  const typeLabel = policy.type === 'aws_managed' ? 'AWS' : inline ? 'INLINE' : 'CUSTOM'
+  const hasDoc = !!policy.document
+  return (
+    <div style={{ borderBottom: '1px solid var(--border)' }}>
+      <div className="policy-row" style={{ cursor: hasDoc ? 'pointer' : 'default', borderBottom: 'none' }}
+        onClick={() => hasDoc && setOpen(o => !o)}>
+        <span className={`policy-dot ${inline ? 'inline' : 'managed'}`} />
+        <span style={{ overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+          {policy.name}
+        </span>
+        <span className={`policy-type${inline ? ' inline-label' : ''}`}>{typeLabel}</span>
+        {hasDoc && <span style={{ color: 'var(--text-faint)', fontSize: '9px' }}>{open ? '▾' : '▸'}</span>}
+      </div>
+      {open && (
+        <div style={{ padding: '0 0 8px 14px' }}>
+          {policy.actions?.length > 0 && <ActionChips actions={policy.actions} />}
+          <JsonBlock value={policy.document} />
+        </div>
+      )}
+    </div>
+  )
+}
+
+function PermissionsTab({ e, isResource }) {
+  const policies = e.policies || []
+  const actions = e.all_actions || e.actions || []
+  const meta = e.metadata && typeof e.metadata === 'object' ? e.metadata : null
+  const resourcePolicy = meta?.policy || meta?.resource_policy || null
+  const attached = e.attached_principals || []
+
+  const nothing = !policies.length && !actions.length && !resourcePolicy && !attached.length
+  if (nothing) {
+    return <EmptyNote>
+      No policies or permissions recorded for this entity.
+      {isResource && ' Resources only carry permissions through an execution role.'}
+    </EmptyNote>
+  }
+
+  return (
+    <>
+      {policies.length > 0 && (
+        <SbBlock label={`Attached policies (${policies.length})`}>
+          <div style={{ marginTop: 4 }}>
+            {policies.map((p, i) => <PolicyRow key={p.arn || i} policy={p} />)}
+          </div>
+        </SbBlock>
+      )}
+
+      {resourcePolicy && (
+        <SbBlock label="Resource policy">
+          <JsonBlock value={resourcePolicy} />
+        </SbBlock>
+      )}
+
+      {meta?.acl_grants > 0 && (
+        <SbBlock label="ACL grants">
+          <div className="sb-value">{meta.acl_grants} legacy ACL grant(s)</div>
+        </SbBlock>
+      )}
+
+      {attached.length > 0 && (
+        <SbBlock label={`Attached to (${attached.length})`}>
+          <div style={{ marginTop: 4 }}>
+            {attached.map((p, i) => (
+              <div key={i} className="policy-row">
+                <span className="policy-dot managed" />
+                <span style={{ overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+                  {typeof p === 'string' ? p : p.name}
+                </span>
+                {typeof p !== 'string' && p.type && <span className="policy-type">{p.type}</span>}
+              </div>
+            ))}
+          </div>
+        </SbBlock>
+      )}
+
+      {actions.length > 0 && (
+        <SbBlock label={`Effective permissions (${actions.length})`}>
+          <ActionChips actions={actions} />
+        </SbBlock>
+      )}
+    </>
+  )
+}
+
+// ─── Tab: Trust ───────────────────────────────────────────────────────────────
+
+function TrustTab({ e }) {
+  const trusts = e.trust_principals || []
+  // /api/node ships the trust policy as a JSON string; graph nodes may already
+  // hold a parsed object.
+  const doc = useMemo(() => {
+    const raw = e.trust_policy
+    if (!raw) return null
+    if (typeof raw !== 'string') return raw
+    try { return JSON.parse(raw) } catch { return raw }
+  }, [e.trust_policy])
+
+  if (!trusts.length && !doc) {
+    return <EmptyNote>No trust policy — only IAM roles have one.</EmptyNote>
+  }
+
+  return (
+    <>
+      {trusts.length > 0 && (
+        <SbBlock label={`Trusted principals (${trusts.length})`}>
+          <div style={{ marginTop: 6 }}>
+            {trusts.map((p, i) => {
+              const wildcard = String(p).includes('*')
+              const isService = String(p).endsWith('.amazonaws.com')
+              return (
+                <div key={i} className={`trust-row${wildcard ? ' warn' : ''}`}>
+                  <MiniPill variant={isService ? 'service' : 'principal'}>
+                    {isService ? 'SERVICE' : 'PRINCIPAL'}
+                  </MiniPill>
+                  <span style={{ overflow: 'hidden', textOverflow: 'ellipsis',
+                                 whiteSpace: 'nowrap' }}>{p}</span>
+                  {wildcard && <span className="trust-warn-icon">⚠</span>}
+                </div>
+              )
+            })}
+          </div>
+        </SbBlock>
+      )}
+      {doc && (
+        <SbBlock label="Trust policy document">
+          <JsonBlock value={doc} maxHeight={420} />
+        </SbBlock>
+      )}
+    </>
+  )
+}
+
+// ─── Tab: Risk ────────────────────────────────────────────────────────────────
+
+const SEV_ORDER = ['CRITICAL', 'HIGH', 'MEDIUM', 'LOW']
+
+/** Paths shown inline before deferring to the PrivEsc page. */
+const PATH_PAGE = 50
+
+function PathRow({ path }) {
+  const [open, setOpen] = useState(false)
+  const [steps, setSteps] = useState(null)
+  async function toggle() {
+    setOpen(o => !o)
+    if (steps === null) {
+      try { setSteps((await api.attackPathDetail(path.id))?.steps || []) }
+      catch { setSteps([]) }
+    }
+  }
+  return (
+    <div style={{ borderBottom: '1px solid var(--border)', padding: '6px 0' }}>
+      <div onClick={toggle} style={{ display: 'flex', alignItems: 'center', gap: 6,
+                                     cursor: 'pointer', fontSize: '11px' }}>
+        <MiniPill variant={path.severity === 'CRITICAL' ? 'critical' : 'high'}>
+          {path.severity}
+        </MiniPill>
+        <span style={{ color: 'var(--text)', overflow: 'hidden', textOverflow: 'ellipsis',
+                       whiteSpace: 'nowrap', flex: 1 }}>{path.summary || path.objective_value}</span>
+        <span style={{ color: 'var(--text-faint)', fontSize: '9px' }}>
+          {path.total_hops} hops {open ? '▾' : '▸'}
+        </span>
+      </div>
+      {open && (
+        <div style={{ marginTop: 4, paddingLeft: 8 }}>
+          {steps === null && <span style={{ fontSize: '10px', color: 'var(--text-faint)' }}>loading…</span>}
+          {steps?.map((s, i) => (
+            <div key={i} style={{ fontSize: '10px', color: 'var(--text-dim)', lineHeight: 1.6 }}>
+              <span style={{ color: 'var(--text-faint)' }}>{i + 1}.</span>{' '}
+              <span style={{ fontFamily: 'IBM Plex Mono, monospace' }}>{s.action}</span>{' → '}
+              <span style={{ color: 'var(--text)' }}>{String(s.target_arn).split('/').pop()}</span>
+            </div>
+          ))}
+        </div>
+      )}
+    </div>
+  )
+}
+
+function RiskTab({ arn, risk, fallbackFindings, hasAnyAssessment, onRunAssessment, running }) {
+  const { data: findings, isLoading } = useQuery({
+    queryKey: ['entity-findings', arn],
+    queryFn: () => api.entityFindings(arn),
+    enabled: !!arn,
+  })
+  const { data: paths } = useQuery({
+    queryKey: ['entity-paths', arn],
+    queryFn: () => api.attackPathsInvolving(arn),
+    enabled: !!arn,
+  })
+
+  const list = (findings ?? fallbackFindings ?? []).filter(f => !f.suppressed)
+  const grouped = SEV_ORDER
+    .map(sev => [sev, list.filter(f => f.severity === sev)])
+    .filter(([, rows]) => rows.length > 0)
+
+  return (
+    <>
+      <SbBlock label="Risk">
+        <div style={{ marginTop: 4 }}><RiskBadge risk={risk} /></div>
+      </SbBlock>
+
+      {isLoading && <EmptyNote>Loading findings…</EmptyNote>}
+
+      {!isLoading && list.length === 0 && (
+        hasAnyAssessment
+          ? <EmptyNote>No findings recorded for this entity.</EmptyNote>
+          : <div className="sb-block">
+              <div className="sb-label">Risk analysis</div>
+              <div style={{ fontSize: '11px', color: 'var(--text-faint)', margin: '6px 0 8px',
+                            lineHeight: 1.6 }}>
+                No assessment has been run yet. This scans every account, not just
+                this entity.
+              </div>
+              <button className="btn primary sm" disabled={running} onClick={onRunAssessment}>
+                {running ? 'Running…' : '▶ Run assessment'}
+              </button>
+            </div>
+      )}
+
+      {grouped.map(([sev, rows]) => (
+        <SbBlock key={sev} label={`${sev} (${rows.length})`}>
+          <div style={{ marginTop: 4 }}>
+            {rows.map((f, i) => (
+              <div key={f.id ?? i} className="sb-path-row">
+                <MiniPill variant={sev.toLowerCase()}>{f.category}</MiniPill>
+                <div style={{ minWidth: 0 }}>
+                  <div style={{ fontSize: '11px', color: 'var(--text)', lineHeight: 1.5 }}>
+                    {f.message}
+                  </div>
+                  {f.principal_detail && (
+                    <div style={{ fontSize: '10px', color: 'var(--text-faint)', marginTop: 2 }}>
+                      {f.principal_detail}
+                    </div>
+                  )}
+                  {f.downgrade_note && (
+                    <div style={{ fontSize: '10px', color: 'var(--text-faint)', marginTop: 2 }}>
+                      {f.downgrade_note}
+                    </div>
+                  )}
+                </div>
+              </div>
+            ))}
+          </div>
+        </SbBlock>
+      ))}
+
+      {/* Omitted entirely when no PrivEsc scan has produced paths for this ARN. */}
+      {paths?.length > 0 && (
+        <SbBlock label={`Privilege escalation paths (${
+          paths.length > PATH_PAGE ? `${PATH_PAGE}+` : paths.length})`}>
+          <div style={{ marginTop: 4 }}>
+            {paths.slice(0, PATH_PAGE).map(p => <PathRow key={p.id} path={p} />)}
+          </div>
+          {paths.length > PATH_PAGE && (
+            <div style={{ fontSize: '10px', color: 'var(--text-faint)', marginTop: 6 }}>
+              Showing the first {PATH_PAGE}. Open the PrivEsc page for the full list.
+            </div>
+          )}
+        </SbBlock>
+      )}
+    </>
   )
 }
 
 // ─── Main component ───────────────────────────────────────────────────────────
 
-export default function EntityDetailPanel({ entity, findings, onClose, onViewGraph, style = {} }) {
+export default function EntityDetailPanel({
+  entity, findings, onClose, actions = [], extraTabs = [], style = {},
+}) {
+  const [tab, setTab] = useState('overview')
+  const [running, setRunning] = useState(false)
+
+  const arn = entity?.arn || entity?.node_id || ''
+  const nodeId = entity?.node_id
+    || (entity?.node_type && arn ? `${entity.node_type}:${arn}` : null)
+
+  // Rich detail — policy documents, trust policy, resource policy — fetched per
+  // entity. The panel renders immediately from whatever the caller had and
+  // fills in when this resolves.
+  const { data: detail } = useQuery({
+    queryKey: ['node-detail', nodeId],
+    queryFn: () => api.nodeDetail(nodeId),
+    enabled: !!nodeId,
+    retry: false,
+    staleTime: 60_000,
+  })
+
+  const e = useMemo(() => ({ ...(entity || {}), ...(detail || {}) }), [entity, detail])
+
+  const related = useMemo(() => (findings || []).filter(
+    f => !f.suppressed && (f.entity_arn === arn || f.principal_arn === arn)), [findings, arn])
+
   if (!entity) return null
 
-  const t      = entity.principal_type || entity.node_type || entity.policy_type || 'resource'
-  const arn    = entity.arn || entity.node_id || ''
-  const acct   = entity.account_id || ''
-  const label  = entity.label || arn.split('/').pop() || arn
-  const arnName = arn.split('/').pop() || label
-
-  const actions            = entity.actions || []
-  const trusts             = entity.trust_principals || []
-  const policies           = entity.policies || []           // principal's attached policies
-  const attachedPrincipals = entity.attached_principals || [] // policy's attached principals
-  const executionRole      = entity.execution_role || null
-  const service            = entity.service || ''
-  const resourceType       = entity.resource_type || ''
-  const region             = entity.region || ''
-
+  const t = e.principal_type || e.node_type || e.policy_type || 'resource'
   const isPrincipal = ['role', 'user', 'group', 'principal'].includes(t)
-  const isPolicy    = t === 'policy'
-  const isResource  = t === 'resource'
-  const isLocal     = entity.policy_type !== 'aws_managed'
+  const isResource = t === 'resource'
+  const risk = e.risk || computeRisk(e, findings)
+  const label = e.label || String(arn).split('/').pop() || arn
 
-  const risk    = computeRisk(entity, findings)
-  const related = (findings || []).filter(f => !f.suppressed && (f.entity_arn === arn || f.principal_arn === arn))
+  const subtitle = e.policy_type
+    ? `IAM POLICY · ${String(e.policy_type).replace('_', ' ').toUpperCase()}`
+    : isResource
+      ? `AWS ${String(e.service || '').toUpperCase()} ${String(e.resource_type || '').toUpperCase()}`.trim()
+      : `IAM ${String(t).toUpperCase()}`
 
-  // ARN display with account id highlighted
-  function ArnDisplay() {
-    if (!arn) return <span>—</span>
-    if (!acct) return <span>{arn}</span>
-    const parts = arn.split(acct)
-    if (parts.length !== 2) return <span>{arn}</span>
-    const suffix   = parts[1]
-    const slashIdx = suffix.lastIndexOf('/')
-    const prefix2  = slashIdx >= 0 ? suffix.slice(0, slashIdx + 1) : suffix
-    const namePart = slashIdx >= 0 ? suffix.slice(slashIdx + 1) : ''
-    return (
-      <>
-        {parts[0]}
-        <em style={{ color: 'var(--amber)', fontStyle: 'normal' }}>{acct}</em>
-        {prefix2}
-        {namePart && <em style={{ color: 'var(--white)', fontStyle: 'normal' }}>{namePart}</em>}
-      </>
-    )
+  const tabs = [
+    { id: 'overview', label: 'Overview' },
+    { id: 'permissions', label: 'Permissions',
+      count: (e.all_actions || e.actions || []).length || undefined },
+    isPrincipal ? { id: 'trust', label: 'Trust',
+                    count: (e.trust_principals || []).length || undefined } : null,
+    { id: 'risk', label: 'Risk', count: related.length || undefined },
+    ...extraTabs,
+  ].filter(Boolean)
+
+  const active = tabs.some(x => x.id === tab) ? tab : 'overview'
+
+  async function runAssessment() {
+    setRunning(true)
+    try { await api.runSecurityFindings({}) } catch { /* surfaced by the query */ }
+    finally { setRunning(false) }
   }
 
+  // flex:1 1 0 + minWidth:0 is load-bearing: a flex item defaults to
+  // min-width:auto, which lets a long ARN or an open policy document push the
+  // panel wider than the pane it lives in.
   return (
-    <div className="ent-sidebar" style={{ width: '420px', flexShrink: 0, overflowY: 'auto', ...style }}>
-
-      {/* ── Header ── */}
+    <div className="ent-sidebar"
+      style={{ flex: '1 1 0', minWidth: 0, maxWidth: '100%', ...style }}>
       <div className="ent-sidebar-header">
-        <div style={{ display: 'flex', alignItems: 'center', gap: '10px', flex: 1, minWidth: 0 }}>
-          <TypeIcon type={t} size={34} />
-          <div style={{ minWidth: 0 }}>
-            <div style={{
-              fontFamily: "'Syne', sans-serif", fontSize: '17px', fontWeight: 800,
-              color: 'var(--white)', letterSpacing: '-0.02em',
-              whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis',
-            }}>{label}</div>
-            <div style={{ fontSize: '10px', color: 'var(--text-faint)', letterSpacing: '0.08em', textTransform: 'uppercase', marginTop: '1px' }}>
-              {isPolicy ? `IAM POLICY · ${entity.policy_type || ''}` : isResource ? `AWS ${(service + ' ' + resourceType).trim().toUpperCase()}` : `IAM ${t.toUpperCase()}`}
-              {acct ? ` · ${acct}` : ''}
-            </div>
+        <TypeIcon type={t} size={34} />
+        <div style={{ minWidth: 0, flex: 1 }}>
+          <div style={{ fontFamily: 'Syne, sans-serif', fontSize: '15px', fontWeight: 800,
+                        color: 'var(--white)', overflow: 'hidden', textOverflow: 'ellipsis',
+                        whiteSpace: 'nowrap' }}>{label}</div>
+          <div style={{ fontSize: '9px', letterSpacing: '.08em', color: 'var(--text-dim)',
+                        marginTop: 2 }}>
+            {subtitle}{e.account_id ? ` · ${e.account_id}` : ''}
           </div>
         </div>
         {onClose && <button className="slideover-close" onClick={onClose}>✕</button>}
       </div>
 
-      {/* ── ARN ── */}
-      <SbBlock label="ARN">
-        <div className="sb-arn"><ArnDisplay /></div>
-      </SbBlock>
-
-      {/* ── Risk / Paths / Policies grid ── */}
-      {/* For policy: show risk only if local/managed (not AWS managed); omit Paths */}
-      {(isPrincipal || (isPolicy && isLocal) || isResource) && (
-        <div style={{
-          display: 'grid',
-          gridTemplateColumns: isPrincipal ? '1fr 1fr 1fr' : '1fr 1fr',
-          gap: '1px', background: 'var(--border)', borderRadius: '3px', overflow: 'hidden', padding: 0,
-        }}>
-          {[
-            { label: 'Risk',     value: <RiskBadge risk={risk} /> },
-            ...(isPrincipal ? [{ label: 'Paths', value: <span style={{ fontFamily:"'Syne',sans-serif", fontSize:'18px', fontWeight:800, color: related.length > 0 ? 'var(--red-hi)' : 'var(--text-dim)' }}>{related.length}</span> }] : []),
-            ...(isPrincipal ? [{ label: 'Policies', value: <span style={{ fontFamily:"'Syne',sans-serif", fontSize:'18px', fontWeight:800, color:'var(--white)' }}>{policies.length}</span> }] : []),
-            ...(!isPrincipal ? [{ label: 'Actions', value: <span style={{ fontFamily:"'Syne',sans-serif", fontSize:'18px', fontWeight:800, color:'var(--white)' }}>{actions.length}</span> }] : []),
-          ].map(({ label, value }) => (
-            <div key={label} style={{ background: 'var(--bg2)', padding: '10px 12px', textAlign: 'center' }}>
-              <div style={{ fontSize: '10px', letterSpacing: '0.08em', textTransform: 'uppercase', color: 'var(--text-faint)', marginBottom: '4px' }}>{label}</div>
-              {value}
-            </div>
-          ))}
-        </div>
-      )}
-
-      {/* ── PRINCIPAL SECTIONS ── */}
-      {isPrincipal && (
-        <>
-          {/* Trust Policy Principals */}
-          <SbBlock label="Trust Policy Principals">
-            <div style={{ display: 'flex', flexDirection: 'column', gap: '4px', marginTop: '6px' }}>
-              {trusts.length === 0
-                ? <div style={{ fontSize: '12px', color: 'var(--text-faint)' }}>No trust relationships</div>
-                : trusts.map((p, i) => {
-                    const isWild    = p.includes('*')
-                    const isService = p.endsWith('.amazonaws.com')
-                    return (
-                      <div key={i} className={`trust-row${isWild ? ' warn' : ''}`}>
-                        <MiniPill variant={isService ? 'service' : isWild ? 'critical' : 'principal'}>
-                          {isService ? 'SERVICE' : 'PRINCIPAL'}
-                        </MiniPill>
-                        <span style={{ fontSize: '12px', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', color: isWild ? 'var(--amber)' : 'var(--text)' }}>
-                          {p}
-                        </span>
-                        {isWild && <span className="trust-warn-icon">⚠</span>}
-                      </div>
-                    )
-                  })
-              }
-            </div>
-          </SbBlock>
-
-          {/* Attached policies */}
-          {policies.length > 0 && (
-            <SbBlock label="Effective Policies">
-              <div style={{ display: 'flex', flexDirection: 'column', gap: '3px', marginTop: '6px' }}>
-                {policies.map((p, i) => {
-                  const nm       = typeof p === 'string' ? p : (p.name || String(p))
-                  const polType  = typeof p === 'object' ? (p.type || '') : ''
-                  const isInline = polType === 'inline' || nm.toLowerCase().includes('inline')
-                  const isAWS    = polType === 'aws_managed' || nm.startsWith('AWS') || nm.startsWith('Amazon')
-                  return (
-                    <div key={i} className="policy-row">
-                      <div className={`policy-dot ${isInline ? 'inline' : 'managed'}`} />
-                      <span style={{ fontSize: '12px', color: 'var(--text)', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', flex: 1 }}>{nm}</span>
-                      <span className={`policy-type${isInline ? ' inline-label' : ''}`}>
-                        {isInline ? 'INLINE' : isAWS ? 'AWS' : 'CUSTOM'}
-                      </span>
-                    </div>
-                  )
-                })}
-              </div>
-            </SbBlock>
-          )}
-
-          {/* All permissions */}
-          <PermissionsList actions={actions} label="All Permissions" />
-
-          {/* Attack paths */}
-          {related.length > 0 && (
-            <SbBlock label="Known Attack Paths">
-              <div style={{ display: 'flex', flexDirection: 'column', gap: '4px', marginTop: '6px' }}>
-                {related.slice(0, 5).map((f, i) => {
-                  const sev = f.severity || 'HIGH'
-                  return (
-                    <div key={i} className="sb-path-row">
-                      <MiniPill variant={sev === 'CRITICAL' ? 'critical' : sev === 'HIGH' ? 'high' : sev === 'MEDIUM' ? 'medium' : 'dim'}>{sev}</MiniPill>
-                      <span style={{ fontSize: '11px', color: 'var(--text-dim)', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', flex: 1 }}>
-                        {f.message || f.category}
-                      </span>
-                    </div>
-                  )
-                })}
-              </div>
-            </SbBlock>
-          )}
-        </>
-      )}
-
-      {/* ── POLICY SECTIONS ── */}
-      {isPolicy && (
-        <>
-          <PermissionsList actions={actions} label="Granted Actions" />
-
-          {/* Attached principals */}
-          {attachedPrincipals.length > 0 && (
-            <SbBlock label={`Attached To (${attachedPrincipals.length})`}>
-              <div style={{ display: 'flex', flexDirection: 'column', gap: '3px', marginTop: '6px' }}>
-                {attachedPrincipals.slice(0, 8).map((pr, i) => (
-                  <div key={i} className="policy-row">
-                    <div className="policy-dot managed" />
-                    <span style={{ fontSize: '12px', color: 'var(--text)', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', flex: 1 }}>{pr.name}</span>
-                    <span className="policy-type">{pr.type?.toUpperCase()}</span>
-                  </div>
-                ))}
-                {attachedPrincipals.length > 8 && (
-                  <div style={{ fontSize: '11px', color: 'var(--text-faint)', paddingTop: '2px' }}>+{attachedPrincipals.length - 8} more</div>
-                )}
-              </div>
-            </SbBlock>
-          )}
-        </>
-      )}
-
-      {/* ── RESOURCE SECTIONS ── */}
-      {isResource && (
-        <>
-          {/* Service metadata */}
-          <SbBlock label="Resource Metadata">
-            <div style={{ display: 'flex', flexDirection: 'column', gap: '4px', marginTop: '6px' }}>
-              {[
-                ['Service',  service.toUpperCase()],
-                ['Type',     resourceType],
-                ['Region',   region || '—'],
-              ].map(([k, v]) => (
-                <div key={k} style={{ display: 'flex', gap: '8px', fontSize: '12px', fontFamily: 'IBM Plex Mono' }}>
-                  <span style={{ color: 'var(--text-faint)', minWidth: '70px' }}>{k}</span>
-                  <span style={{ color: 'var(--text)' }}>{v || '—'}</span>
-                </div>
-              ))}
-              {executionRole && (
-                <div style={{ display: 'flex', gap: '8px', fontSize: '12px', fontFamily: 'IBM Plex Mono' }}>
-                  <span style={{ color: 'var(--text-faint)', minWidth: '70px' }}>Role</span>
-                  <span style={{ color: 'var(--amber)', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{executionRole.name}</span>
-                </div>
-              )}
-            </div>
-          </SbBlock>
-
-          {/* Network / IMDS / service configuration */}
-          <ResourceMetadataBlock metadata={entity.metadata} />
-
-          {/* Execution role permissions */}
-          {executionRole && actions.length > 0 && (
-            <PermissionsList actions={actions} label="Role Permissions" />
-          )}
-          {!executionRole && (
-            <SbBlock label="Permissions">
-              <div style={{ fontSize: '12px', color: 'var(--text-faint)', marginTop: '4px', lineHeight: 1.6 }}>
-                No execution role attached. Permissions are granted to principals that reference this resource.
-              </div>
-            </SbBlock>
-          )}
-        </>
-      )}
-
-      {/* ── Footer actions ── */}
-      {onViewGraph && (
-        <div className="sb-actions">
-          <button className="btn btn-ghost" style={{ flex: 1, fontSize: '11px', justifyContent: 'center' }} onClick={() => onViewGraph(entity)}>
-            ⬡ View in Graph
+      <div className="tab-bar">
+        {tabs.map(x => (
+          <button key={x.id} className={`tab-btn${active === x.id ? ' active' : ''}`}
+            onClick={() => setTab(x.id)}>
+            {x.label}{x.count ? <span className="tab-count">{x.count}</span> : null}
           </button>
+        ))}
+      </div>
+
+      <div style={{ flex: 1, overflowY: 'auto', minHeight: 0 }}>
+        {active === 'overview' && (
+          <OverviewTab e={e} risk={risk} findingCount={related.length} />
+        )}
+        {active === 'permissions' && <PermissionsTab e={e} isResource={isResource} />}
+        {active === 'trust' && <TrustTab e={e} />}
+        {active === 'risk' && (
+          <RiskTab arn={arn} risk={risk} fallbackFindings={related}
+            hasAnyAssessment={(findings || []).length > 0}
+            onRunAssessment={runAssessment} running={running} />
+        )}
+        {extraTabs.map(x => (active === x.id ? <div key={x.id}>{x.render()}</div> : null))}
+      </div>
+
+      {actions.length > 0 && (
+        <div className="sb-actions">
+          {actions.map((a, i) => (
+            <button key={i} className={`btn ${a.variant || 'secondary'} sm`} title={a.title}
+              style={a.grow ? { flex: 1, justifyContent: 'center' } : undefined}
+              onClick={a.onClick}>{a.label}</button>
+          ))}
         </div>
       )}
     </div>

@@ -19,6 +19,7 @@ venv/
 env/
 .env/
 ENV/
+share/
 bin/
 lib/
 lib64/
@@ -50,6 +51,8 @@ worstassume/viz/frontend/*.local
 .vscode/
 .idea/
 .agents/
+.cursor/
+antigravity_notes/
 *.swp
 *.swo
 *~
@@ -74,3 +77,4 @@ tmp/
 
 # ─── Docker ───────────────────────────────────────────────────────────────────
 .docker/
+SPECS.md

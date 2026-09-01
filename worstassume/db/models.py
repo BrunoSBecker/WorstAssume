@@ -370,6 +370,90 @@ class AttackPathStep(Base):
         return f"<AttackPathStep [{self.step_index}] {self.edge_type}: {self.actor_arn} → {self.target_arn}>"
 
 
+# ─── ThreatModelRun (Phase 5) ─────────────────────────────────────────────────
+
+class ThreatModelRun(Base):
+    """A persisted Threat Model (blast-radius) analysis for a single target ARN.
+
+    Computed on demand and stored so the UI can list past analyses, poll a
+    running job, and re-open completed results across sessions.
+    """
+
+    __tablename__ = "threat_model_runs"
+    __table_args__ = (
+        Index("ix_tmr_target", "target_arn"),
+        Index("ix_tmr_created", "created_at"),
+    )
+
+    id:               Mapped[int]              = mapped_column(Integer, primary_key=True, autoincrement=True)
+    target_arn:       Mapped[str]              = mapped_column(String(2048), nullable=False)
+    target_type:      Mapped[str]              = mapped_column(String(16), nullable=False)  # principal / resource / unknown
+    target_label:     Mapped[str | None]       = mapped_column(String(512))
+    account_id:       Mapped[str | None]       = mapped_column(String(32))  # AWS account id (string), nullable
+    max_hops:         Mapped[int]              = mapped_column(Integer, default=5)
+    status:           Mapped[str]              = mapped_column(String(16), nullable=False, default="running")  # running / done / error
+    error:            Mapped[str | None]       = mapped_column(Text)
+    # Summary counts for the list view (mirror blast_radius)
+    total_unique:     Mapped[int]              = mapped_column(Integer, default=0)
+    direct_count:     Mapped[int]              = mapped_column(Integer, default=0)
+    transitive_count: Mapped[int]              = mapped_column(Integer, default=0)
+    external_count:   Mapped[int]              = mapped_column(Integer, default=0)
+    critical_count:   Mapped[int]              = mapped_column(Integer, default=0)
+    public:           Mapped[bool]             = mapped_column(Boolean, default=False)
+    result_json:      Mapped[str | None]       = mapped_column(Text)
+    created_at:       Mapped[datetime]         = mapped_column(DateTime, default=datetime.utcnow)
+    finished_at:      Mapped[datetime | None]  = mapped_column(DateTime)
+
+    @property
+    def result(self) -> dict | None:
+        if self.result_json:
+            return json.loads(self.result_json)
+        return None
+
+    def __repr__(self) -> str:
+        return f"<ThreatModelRun [{self.status}] {self.target_arn}>"
+
+
+# ─── ThreatModelGraph ─────────────────────────────────────────────────────────
+
+class ThreatModelGraph(Base):
+    """A saved Threat Model exploration — the graph an analyst built by hand.
+
+    The Threat Model page is iterative: the analyst seeds a crown-jewel asset,
+    expands its inbound neighbours, expands one of those, prunes what is noise,
+    and repeats. That exploration is the artefact worth keeping, so the whole
+    canvas (nodes, edges, layout, what was expanded, what was removed) is
+    persisted as one JSON blob rather than recomputed.
+    """
+
+    __tablename__ = "threat_model_graphs"
+    __table_args__ = (
+        Index("ix_tmg_root", "root_arn"),
+        Index("ix_tmg_updated", "updated_at"),
+    )
+
+    id:         Mapped[int]             = mapped_column(Integer, primary_key=True, autoincrement=True)
+    name:       Mapped[str]             = mapped_column(String(256), nullable=False)
+    root_arn:   Mapped[str | None]      = mapped_column(String(2048))
+    account_id: Mapped[str | None]      = mapped_column(String(32))  # AWS account id (string)
+    node_count: Mapped[int]             = mapped_column(Integer, default=0)
+    edge_count: Mapped[int]             = mapped_column(Integer, default=0)
+    notes:      Mapped[str | None]      = mapped_column(Text)
+    graph_json: Mapped[str | None]      = mapped_column(Text)
+    created_at: Mapped[datetime]        = mapped_column(DateTime, default=datetime.utcnow)
+    updated_at: Mapped[datetime]        = mapped_column(DateTime, default=datetime.utcnow,
+                                                        onupdate=datetime.utcnow)
+
+    @property
+    def graph(self) -> dict | None:
+        if self.graph_json:
+            return json.loads(self.graph_json)
+        return None
+
+    def __repr__(self) -> str:
+        return f"<ThreatModelGraph {self.name!r} nodes={self.node_count}>"
+
+
 # ─── GroupMembership (Phase 8) ──────────────────────────────────────────────────────────────
 
 class GroupMembership(Base):

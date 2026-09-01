@@ -1,3 +1,5 @@
+/* eslint-disable no-use-before-define -- unused component: nothing imports
+   EntityPanel; kept for reference only. Delete once confirmed obsolete. */
 import { useState, useEffect, useMemo } from 'react'
 import Chip from '@mui/material/Chip'
 import TextField from '@mui/material/TextField'

@@ -86,10 +86,10 @@ function PrincipalSearch({ label, value, onChange }) {
 
 // ─── Analyze modal ─────────────────────────────────────────────────────────────
 
-function AnalyzeModal({ onRun, onClose }) {
+function AnalyzeModal({ onRun, onClose, initialObjective = null }) {
   const [fromArn,   setFromArn]   = useState('')
-  const [objective, setObjective] = useState('')
-  const [customObj, setCustomObj] = useState('')
+  const [objective, setObjective] = useState(initialObjective ? '__custom__' : '')
+  const [customObj, setCustomObj] = useState(initialObjective || '')
   const [maxHops,   setMaxHops]   = useState(10)
   const [running,   setRunning]   = useState(false)
   const [err,       setErr]       = useState(null)
@@ -153,7 +153,7 @@ function AnalyzeModal({ onRun, onClose }) {
 
 // ─── Path row ──────────────────────────────────────────────────────────────────
 
-function PathRow({ path, expanded, onExpand, onViewGraph }) {
+function PathRow({ path, expanded, onExpand, onViewGraph, onAddToCanvas }) {
   const sev        = (path.severity || 'MEDIUM').toLowerCase()
   const [steps,    setSteps]    = useState(path.steps || null)
   const [loadingS, setLoadingS] = useState(false)
@@ -237,6 +237,13 @@ function PathRow({ path, expanded, onExpand, onViewGraph }) {
                 <button className="btn primary sm" onClick={() => onViewGraph(capped)}>
                   🕸 View in graph
                 </button>
+                {/* The overlay above is ephemeral review; this contributes the
+                    path to the shared engagement canvas instead. */}
+                <button className="btn secondary sm" style={{ marginLeft: 8 }}
+                  title="Add every identity on this path to the engagement graph"
+                  onClick={() => onAddToCanvas(steps)}>
+                  ＋ Add to canvas
+                </button>
               </div>
             )
           })()}
@@ -254,6 +261,7 @@ function PathRow({ path, expanded, onExpand, onViewGraph }) {
 // ─── Page ─────────────────────────────────────────────────────────────────────
 
 export default function PrivEscPage() {
+  const { privEscObjective, clearPrivEscObjective, canvas, showToast } = useApp()
   const [storedPaths, setStoredPaths] = useState(null)
   const [loadErr,     setLoadErr]     = useState(null)
   const [sevFilter,   setSevFilter]   = useState('All')
@@ -261,6 +269,11 @@ export default function PrivEscPage() {
   const [expanded,    setExpanded]    = useState(null)
   const [showModal,   setShowModal]   = useState(false)
   const [running,     setRunning]     = useState(false)
+
+  // Opened via Threat Model "Find PrivEsc paths to this identity" handoff
+  useEffect(() => {
+    if (privEscObjective) setShowModal(true)
+  }, [privEscObjective])
 
   const PAGE_SIZE = 25
 
@@ -317,7 +330,8 @@ export default function PrivEscPage() {
       {showModal && (
         <AnalyzeModal
           onRun={runAnalysis}
-          onClose={() => setShowModal(false)}
+          initialObjective={privEscObjective}
+          onClose={() => { setShowModal(false); clearPrivEscObjective() }}
         />
       )}
       {graphSteps && (
@@ -385,6 +399,19 @@ export default function PrivEscPage() {
         ) : (
           pageItems.map((p, i) => (
             <PathRow
+              onAddToCanvas={steps => {
+                const seen = new Map()
+                steps.forEach(s => {
+                  for (const arn of [s.actor_arn, s.target_arn]) {
+                    if (arn && !seen.has(arn)) {
+                      seen.set(arn, { arn, label: String(arn).split('/').pop() || arn })
+                    }
+                  }
+                })
+                const n = canvas.add([...seen.values()])
+                showToast?.(n ? `Added ${n} node(s) to the engagement graph`
+                              : 'Already on the engagement graph')
+              }}
               key={p.id ?? i}
               path={p}
               expanded={expanded === (p.id ?? i)}

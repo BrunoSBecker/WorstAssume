@@ -103,6 +103,39 @@ def build_attack_graph(
     return G
 
 
+def build_access_graph(
+    db: Session,
+    account: Account | None = None,
+) -> nx.MultiDiGraph:
+    """Build a *sparse access/pivot* graph for reverse-reachability analysis.
+
+    Same nodes as build_attack_graph() but only the access/pivot edge families
+    (assume-role, cross-account, PassRole→compute credential-theft, resource
+    abuse, lateral movement, secret harvest) — see
+    NeighborContext.get_access_neighbors().
+
+    Excludes the dense IAM-manipulation / group-membership escalation edges
+    (O(P²)), so it scales to large orgs. Consumed by core/threat_model.py.
+    """
+    ctx = NeighborContext(db, account=account)
+    G   = nx.MultiDiGraph()
+    _build_nodes(G, ctx.principals, ctx.resources)
+
+    edge_count = 0
+    for p in ctx.principals:
+        if p.principal_type not in ("user", "role"):
+            continue
+        for neighbor_arn, edge_data in ctx.get_access_neighbors(p.arn):
+            if p.arn not in G or neighbor_arn not in G:
+                continue
+            G.add_edge(p.arn, neighbor_arn, **edge_data)
+            edge_count += 1
+
+    log.info("[access_graph] built: %d nodes, %d edges",
+             G.number_of_nodes(), G.number_of_edges())
+    return G
+
+
 # ── NeighborContext ────────────────────────────────────────────────────────
 
 class NeighborContext:
@@ -127,12 +160,50 @@ class NeighborContext:
         self._principal_by_arn: dict[str, Principal] = {
             p.arn: p for p in self.principals
         }
+        self._resource_by_arn: dict[str, Resource] = {
+            r.arn: r for r in self.resources
+        }
         self._roles: list[Principal] = [
             p for p in self.principals if p.principal_type == "role"
         ]
+        self._role_by_arn: dict[str, Principal] = {p.arn: p for p in self._roles}
         self._groups: list[Principal] = [
             p for p in self.principals if p.principal_type == "group"
         ]
+
+        # Resources grouped by the execution role they hand credentials to.
+        self._resources_by_exec_role: dict[str, list[Resource]] = {}
+        for r in self.resources:
+            if r.execution_role:
+                self._resources_by_exec_role.setdefault(
+                    r.execution_role.arn, []).append(r)
+
+        # Cross-account links grouped by the role they grant access to.
+        self._cross_links_by_role: dict[str, list[CrossAccountLink]] = {}
+        for link in self.cross_links:
+            if link.role_arn:
+                self._cross_links_by_role.setdefault(link.role_arn, []).append(link)
+
+        # Parse each role's trust policy exactly once (the .trust_policy property
+        # does a json.loads on every access). Reused by the assume-role scan so
+        # it is O(roles) parses instead of O(attackers × roles).
+        self._trust_cache: dict[str, dict | None] = {
+            p.arn: p.trust_policy for p in self._roles
+        }
+
+        # Inverted trust index: trusted-principal key -> set of role ARNs that
+        # trust it. Keys are "*" (wildcard), an exact principal ARN, or an
+        # account root ARN — exactly the three forms _actor_can_assume matches.
+        # Replaces the O(attackers × roles) pair-check in _lateral_neighbors.
+        self._roles_trusting: dict[str, set[str]] = _build_trust_index(
+            self._roles, self._trust_cache)
+
+        # Deduped abuse targets per rule, computed once. Targets collapse via
+        # execution_role.arn, so e.g. thousands of Lambdas become far fewer
+        # unique roles. Also avoids re-reading Resource.extra (a json.loads
+        # property) on every expansion.
+        self._abuse_targets_by_rule: dict[str, list[str]] = \
+            _build_abuse_targets(self.resources)
 
     # ── Public interface ─────────────────────────────────────────────────
 
@@ -154,6 +225,28 @@ class NeighborContext:
         yield from self._resource_abuse_neighbors(attacker)
         yield from self._lateral_neighbors(attacker)
         yield from self._group_membership_neighbors(attacker)
+
+    def get_access_neighbors(
+        self, arn: str
+    ) -> Iterator[tuple[str, dict[str, Any]]]:
+        """Yield only *access / pivot* edges for arn — assume-role, cross-account,
+        PassRole→compute credential-theft, resource-abuse, lateral movement and
+        secret harvesting.
+
+        Deliberately excludes the dense IAM-manipulation (_iam_neighbors) and
+        group-membership (_group_membership_neighbors) families: those model
+        *privilege escalation* ("X can rewrite Y's permissions"), fan out one
+        privileged principal to every other principal (O(P²)), and are the
+        domain of the PrivEsc scan. Used by the Threat Model reverse-reachability
+        analysis so it scales to large orgs and answers "if this identity is
+        compromised, can it reach the target?".
+        """
+        attacker = self._principal_by_arn.get(arn)
+        if attacker is None or attacker.principal_type not in ("user", "role"):
+            return
+        yield from self._passrole_neighbors(attacker)
+        yield from self._resource_abuse_neighbors(attacker)
+        yield from self._lateral_neighbors(attacker)
 
     # ── Neighbor generators (one per edge family) ──────────────────────
 
@@ -213,46 +306,14 @@ class NeighborContext:
     ) -> Iterator[tuple[str, dict]]:
         actions = self.action_cache.get(attacker.arn, frozenset())
         for svc, rtype, action, edge_type, path_id, severity in _RESOURCE_ABUSE_TABLE:
+            if not _abuse_rule_allowed(edge_type, action, actions):
+                continue
             expl = _EXPLANATIONS.get(path_id, edge_type)
-
-            if edge_type == "imds_steal":
-                for r in self.resources:
-                    if r.service != "ec2" or r.resource_type != "instance":
-                        continue
-                    extra = r.extra or {}
-                    if extra.get("MetadataOptions", {}).get("HttpTokens") == "required":
-                        continue
-                    target = r.execution_role.arn if r.execution_role else r.arn
-                    yield target, dict(
-                        edge_type=edge_type, path_id=path_id,
-                        action="http://169.254.169.254/ (IMDSv1)",
-                        severity=severity, explanation=expl,
-                    )
-                continue
-
-            if edge_type == "ecs_metadata_steal":
-                for r in self.resources:
-                    if r.service != "ecs":
-                        continue
-                    if r.execution_role:
-                        yield r.execution_role.arn, dict(
-                            edge_type=edge_type, path_id=path_id,
-                            action="ECS task metadata endpoint",
-                            severity=severity, explanation=expl,
-                        )
-                continue
-
-            if not _can_do(actions, action):
-                continue
-            for r in self.resources:
-                if svc and r.service != svc:
-                    continue
-                if rtype and r.resource_type != rtype:
-                    continue
-                target = r.execution_role.arn if r.execution_role else r.arn
+            edge_action = _abuse_edge_action(edge_type, action)
+            for target in self._abuse_targets_by_rule.get(edge_type, ()):
                 yield target, dict(
                     edge_type=edge_type, path_id=path_id,
-                    action=action, severity=severity, explanation=expl,
+                    action=edge_action, severity=severity, explanation=expl,
                 )
 
     def _lateral_neighbors(
@@ -261,14 +322,11 @@ class NeighborContext:
         actions = self.action_cache.get(attacker.arn, frozenset())
         acct_id = attacker.account.account_id if attacker.account else ""
 
-        # sts:AssumeRole
+        # sts:AssumeRole — candidates come from the inverted trust index, so this
+        # is O(assumable roles) instead of O(all roles) trust checks.
         if _can_do(actions, "sts:AssumeRole"):
             assume_count = 0
-            for target_role in self._roles:
-                if not _actor_can_assume(attacker, target_role):
-                    log.debug("[assume] skip %s → %s: trust policy mismatch",
-                              attacker.arn, target_role.arn)
-                    continue
+            for target_role in self._assumable_roles(attacker, acct_id):
                 target_acct = target_role.account.account_id \
                               if target_role.account else ""
                 is_cross  = target_acct != acct_id
@@ -324,6 +382,25 @@ class NeighborContext:
                     action="sts:AssumeRole (cross-account)", severity=sev,
                     explanation=_EXPLANATIONS.get("PATH-031", "cross_account_assume"),
                 )
+
+    def _assumable_roles(
+        self, attacker: Principal, actor_acct: str
+    ) -> Iterator[Principal]:
+        """Yield the roles whose trust policy admits *attacker*.
+
+        Uses the inverted trust index built in __init__ rather than evaluating
+        _actor_can_assume() against every role. Equivalent by construction:
+        the index keys are the same three forms that helper matches.
+        """
+        candidates: set[str] = set(self._roles_trusting.get("*", ()))
+        candidates |= self._roles_trusting.get(attacker.arn, set())
+        if actor_acct:
+            candidates |= self._roles_trusting.get(
+                f"arn:aws:iam::{actor_acct}:root", set())
+        for role_arn in sorted(candidates):
+            role = self._role_by_arn.get(role_arn)
+            if role is not None:
+                yield role
 
     def _group_membership_neighbors(
         self, attacker: Principal
@@ -486,17 +563,139 @@ _RESOURCE_ABUSE_TABLE = [
     ("sagemaker", None,        "sagemaker:CreatePresignedNotebookInstanceUrl", "sagemaker_notebook_hijack", "PATH-026", SEVERITY_HIGH),
     ("ec2",       "instance",  None,                                           "imds_steal",                "PATH-014", SEVERITY_MEDIUM),
     ("ecs",       "task-definition", None,                                      "ecs_metadata_steal",        "PATH-037", SEVERITY_MEDIUM),
-    (None,        None,        "ec2-instance-connect:SendSSHPublicKey",        "ec2_instance_connect",      "PATH-033", SEVERITY_MEDIUM),
-    (None,        None,        "s3:PutBucketPolicy",                           "s3_bucket_policy_abuse",    "PATH-035", SEVERITY_HIGH),
+    ("ec2",       "instance",  "ec2-instance-connect:SendSSHPublicKey",        "ec2_instance_connect",      "PATH-033", SEVERITY_MEDIUM),
+    ("s3",        "bucket",    "s3:PutBucketPolicy",                           "s3_bucket_policy_abuse",    "PATH-035", SEVERITY_HIGH),
 ]
 
+# Actions that let an attacker execute code *on* an instance / task. Without one
+# of these (or the credentials already being on the box) the metadata endpoint is
+# unreachable, so imds_steal / ecs_metadata_steal must not fan out from every
+# principal in the account.
+_IMDS_LANDING_ACTIONS = (
+    "ssm:SendCommand",
+    "ec2-instance-connect:SendSSHPublicKey",
+    "ec2:RunInstances",
+)
+_ECS_LANDING_ACTIONS = (
+    "ecs:RunTask",
+    "ecs:ExecuteCommand",
+    "ecs:UpdateService",
+    "ecs:RegisterTaskDefinition",
+    "ssm:SendCommand",
+    "ec2:RunInstances",
+)
+
+
+
+# ── Resource-abuse rule helpers ──────────────────────────────────────────────
+
+def _abuse_edge_action(edge_type: str, action: str | None) -> str:
+    """The human-facing action string stamped on a resource-abuse edge."""
+    if edge_type == "imds_steal":
+        return "http://169.254.169.254/ (IMDSv1)"
+    if edge_type == "ecs_metadata_steal":
+        return "ECS task metadata endpoint"
+    return action or edge_type
+
+
+def _abuse_rule_allowed(
+    edge_type: str, action: str | None, actions: frozenset[str] | set[str]
+) -> bool:
+    """Return True if *actions* lets the attacker exercise this abuse rule.
+
+    The two metadata-theft rules have no single API action to gate on: reaching
+    IMDS or the ECS task metadata endpoint requires code execution on the
+    instance/task, so they are gated on the actions that get you there.
+    """
+    if edge_type == "imds_steal":
+        return any(_can_do(actions, a) for a in _IMDS_LANDING_ACTIONS)
+    if edge_type == "ecs_metadata_steal":
+        return any(_can_do(actions, a) for a in _ECS_LANDING_ACTIONS)
+    return bool(action) and _can_do(actions, action)
+
+
+def _abuse_rule_matches_resource(
+    edge_type: str, svc: str | None, rtype: str | None, r: Resource
+) -> bool:
+    """Return True if resource *r* is a valid target for this abuse rule."""
+    if edge_type == "imds_steal":
+        if r.service != "ec2" or r.resource_type != "instance":
+            return False
+        extra = r.extra or {}
+        # IMDSv2-only instances do not leak credentials to a bare GET.
+        return extra.get("MetadataOptions", {}).get("HttpTokens") != "required"
+    if edge_type == "ecs_metadata_steal":
+        # Historically matched on service alone (the table's "task-definition"
+        # resource_type was never applied); kept as-is, but an execution role is
+        # required since that is what the edge points at.
+        return r.service == "ecs" and r.execution_role is not None
+    if svc and r.service != svc:
+        return False
+    if rtype and r.resource_type != rtype:
+        return False
+    return True
+
+
+def _build_abuse_targets(resources: list) -> dict[str, list[str]]:
+    """Precompute the deduped target ARN set for each resource-abuse rule.
+
+    Targets collapse onto execution_role.arn where one exists, so many
+    resources share a target. Built once per NeighborContext instead of
+    re-scanning every resource on each expansion.
+    """
+    out: dict[str, list[str]] = {}
+    for svc, rtype, _action, edge_type, _pid, _sev in _RESOURCE_ABUSE_TABLE:
+        targets: set[str] = set()
+        for r in resources:
+            if not _abuse_rule_matches_resource(edge_type, svc, rtype, r):
+                continue
+            targets.add(r.execution_role.arn if r.execution_role else r.arn)
+        out[edge_type] = sorted(targets)
+    return out
+
+
+def _build_trust_index(
+    roles: list, trust_cache: dict[str, dict | None]
+) -> dict[str, set[str]]:
+    """Invert role trust policies: trusted-principal key -> role ARNs.
+
+    Keys mirror the three forms _actor_can_assume() accepts: "*" for a wildcard
+    Principal (or a "*" entry under Principal.AWS), and otherwise the literal
+    string from Principal.AWS — which covers both exact principal ARNs and
+    account-root ARNs.
+    """
+    index: dict[str, set[str]] = {}
+    for role in roles:
+        trust = trust_cache.get(role.arn)
+        if not trust:
+            continue
+        for stmt in _normalize_stmts(trust):
+            if not isinstance(stmt, dict) or stmt.get("Effect") != "Allow":
+                continue
+            principal = stmt.get("Principal", {})
+            if principal == "*":
+                index.setdefault("*", set()).add(role.arn)
+                continue
+            aws = principal.get("AWS", []) if isinstance(principal, dict) else []
+            if isinstance(aws, str):
+                aws = [aws]
+            for entry in aws:
+                if isinstance(entry, str):
+                    index.setdefault(entry, set()).add(role.arn)
+    return index
 
 
 # ── Trust-policy helpers ─────────────────────────────────────────────────────────
 
-def _actor_can_assume(actor: Principal, target_role: Principal) -> bool:
-    """Return True if actor's ARN or account root is trusted by target_role's trust policy."""
-    trust = target_role.trust_policy  # uses @property from models.py
+def _actor_can_assume(actor: Principal, target_role: Principal,
+                      trust: dict | None = None) -> bool:
+    """Return True if actor's ARN or account root is trusted by target_role's trust policy.
+
+    `trust` may be supplied pre-parsed (from NeighborContext._trust_cache) to
+    avoid re-running json.loads for every attacker; falls back to the property.
+    """
+    if trust is None:
+        trust = target_role.trust_policy  # uses @property from models.py
     if not trust:
         return False
     actor_acct = actor.account.account_id if actor.account else ""

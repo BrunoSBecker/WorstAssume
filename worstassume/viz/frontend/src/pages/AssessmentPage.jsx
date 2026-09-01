@@ -90,7 +90,7 @@ function RunModal({ accounts, onRun, onClose }) {
 // ─── Finding row ──────────────────────────────────────────────────────────────
 
 function FindingRow({ finding, expanded, onToggle }) {
-  const { focusNode } = useApp()
+  const { focusNode, canvas, showToast } = useApp()
   const sev  = sevClass(finding.severity)
   const name = finding.entity_name || (finding.entity_arn || '').split('/').pop()
   const arn  = finding.entity_arn || ''
@@ -144,10 +144,26 @@ function FindingRow({ finding, expanded, onToggle }) {
             </div>
           )}
           {arn && (
-            <div style={{ marginTop:'10px' }}>
+            <div style={{ marginTop:'10px', display:'flex', gap:'8px' }}>
               <button className="btn secondary sm"
                 onClick={(e) => { e.stopPropagation(); focusNode(findingNodeId(finding)) }}>
                 ⬡ Find in graph
+              </button>
+              {/* Contributes to the shared engagement canvas without touching
+                  this page's own ephemeral graph overlay. */}
+              <button className="btn secondary sm"
+                title="Add this entity to the shared engagement graph"
+                onClick={(e) => {
+                  e.stopPropagation()
+                  const n = canvas.add({
+                    arn, label: finding.entity_name || arn,
+                    node_type: finding.entity_type === 'resource' ? 'resource' : 'principal',
+                    principal_type: finding.entity_type,
+                  })
+                  showToast?.(n ? `Added ${finding.entity_name || arn} to the engagement graph`
+                                : 'Already on the engagement graph')
+                }}>
+                ＋ Add to canvas
               </button>
             </div>
           )}

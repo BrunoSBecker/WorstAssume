@@ -5,21 +5,15 @@ import { api } from '../api'
 import GraphViewer from '../components/GraphViewer'
 import EntityDetailPanel from '../components/EntityDetailPanel'
 import Paginator from '../components/Paginator'
+import ResizeHandle from '../components/ResizeHandle'
+import { useResizableWidth } from '../components/useResizableWidth'
+import { RiskBadge, TypeIcon } from '../components/EntityBits'
+import { RISK_FILTERS, TYPE_MAP, selectStyle as _selectStyle } from '../components/entityStyles'
 
 // ─── Helpers ──────────────────────────────────────────────
-const TYPE_ICON = { role: '⚙', user: '👤', group: '👥', policy: '📄', resource: '☁', account: '🔷' }
 const TYPE_TABS = ['All', 'Roles', 'Users', 'Groups', 'Policies', 'Resources']
-const TYPE_MAP = { Roles: 'role', Users: 'user', Groups: 'group', Policies: 'policy', Resources: 'resource' }
-const RISK_FILTERS = ['All Risk', 'Critical', 'High', 'Clean']
 const SERVICE_FILTERS = ['All', 'ec2', 's3', 'lambda', 'ecs', 'vpc']
 const SERVICE_LABEL = { ec2: 'EC2', s3: 'S3', lambda: 'Lambda', ecs: 'ECS', vpc: 'VPC' }
-const _selectStyle = (active) => ({
-  background: active ? 'rgba(217,124,20,.08)' : 'var(--bg3)',
-  color: active ? 'var(--amber)' : 'var(--text-dim)',
-  border: `1px solid ${active ? 'rgba(217,124,20,.3)' : 'var(--border2)'}`,
-  borderRadius: 3, padding: '3px 8px', fontSize: 10,
-  fontFamily: 'IBM Plex Mono, monospace', cursor: 'pointer', outline: 'none',
-})
 
 // NOTE: AWS-managed detection and IAM-style permission matching now happen
 // server-side in the EntityIndex (see /api/entities). The page just forwards
@@ -112,66 +106,6 @@ function PermissionMultiSelect({ selected, onChange, options, query, onQueryChan
 }
 
 
-const RISK_STYLE = {
-  CRITICAL: { bg: 'rgba(192,48,48,.12)', color: 'var(--red-hi)', border: 'rgba(192,48,48,.3)' },
-  HIGH: { bg: 'rgba(217,124,20,.12)', color: 'var(--amber-hi)', border: 'rgba(217,124,20,.3)' },
-  MEDIUM: { bg: 'rgba(184,160,32,.10)', color: 'var(--yellow-hi)', border: 'rgba(184,160,32,.25)' },
-  LOW: { bg: 'rgba(42,112,128,.10)', color: 'var(--cyan-hi)', border: 'rgba(42,112,128,.25)' },
-  CLEAN: { bg: 'rgba(46,125,82,.10)', color: 'var(--green-hi)', border: 'rgba(46,125,82,.25)' },
-}
-
-function RiskBadge({ risk, style = {} }) {
-  const s = RISK_STYLE[risk] || RISK_STYLE.LOW
-  return (
-    <span style={{
-      display: 'inline-flex', alignItems: 'center',
-      padding: '1px 6px', borderRadius: '2px', fontSize: '9px',
-      fontWeight: 600, letterSpacing: '0.06em', whiteSpace: 'nowrap',
-      background: s.bg, color: s.color, border: `1px solid ${s.border}`,
-      ...style,
-    }}>{risk}</span>
-  )
-}
-
-function TypeIcon({ type, size = 26 }) {
-  const S = {
-    role: { bg: 'rgba(58,154,176,.1)', border: 'rgba(58,154,176,.4)', color: 'var(--cyan-hi)' },
-    user: { bg: 'rgba(90,96,112,.12)', border: 'var(--border2)', color: 'var(--text-dim)' },
-    group: { bg: 'rgba(154,127,200,.1)', border: 'rgba(154,127,200,.4)', color: '#9a7fc8' },
-    policy: { bg: 'rgba(200,120,176,.1)', border: 'rgba(200,120,176,.4)', color: '#c878b0' },
-    resource: { bg: 'rgba(46,125,82,.1)', border: 'rgba(46,125,82,.4)', color: 'var(--green-hi)' },
-    account: { bg: 'rgba(90,96,112,.1)', border: 'var(--border2)', color: 'var(--text-faint)' },
-  }
-  const s = S[type] || S.role
-  return (
-    <div style={{
-      width: size, height: size, borderRadius: '50%', flexShrink: 0,
-      display: 'flex', alignItems: 'center', justifyContent: 'center',
-      background: s.bg, border: `1.5px solid ${s.border}`, color: s.color, fontSize: size * 0.44,
-    }}>{TYPE_ICON[type] || '?'}</div>
-  )
-}
-
-function MiniPill({ variant = 'dim', children }) {
-  const S = {
-    service: { bg: 'rgba(42,112,128,.1)', color: 'var(--cyan-hi)', border: '1px solid rgba(42,112,128,.25)' },
-    principal: { bg: 'rgba(217,124,20,.1)', color: 'var(--amber)', border: '1px solid rgba(217,124,20,.25)' },
-    critical: { bg: 'rgba(192,48,48,.12)', color: 'var(--red-hi)', border: '1px solid rgba(192,48,48,.3)' },
-    high: { bg: 'rgba(217,124,20,.12)', color: 'var(--amber-hi)', border: '1px solid rgba(217,124,20,.3)' },
-    dim: { bg: 'var(--bg3)', color: 'var(--text-dim)', border: '1px solid var(--border2)' },
-  }
-  const s = S[variant] || S.dim
-  return (
-    <span style={{
-      display: 'inline-flex', alignItems: 'center', padding: '1px 7px',
-      borderRadius: '2px', fontSize: '10px', fontWeight: 600,
-      letterSpacing: '0.06em', flexShrink: 0, whiteSpace: 'nowrap',
-      background: s.bg, color: s.color, border: s.border,
-    }}>{children}</span>
-  )
-}
-
-
 // Map the tri-state Managed/Custom checkboxes to the server `managed` param
 function managedParam(showManaged, showCustom) {
   if (showManaged && showCustom) return 'all'
@@ -182,13 +116,34 @@ function managedParam(showManaged, showCustom) {
 
 // ─── Main Page ────────────────────────────────────────────
 export default function EntitiesPage() {
-  const { findings } = useApp()
+  const { findings, canvas, showToast, setPage: navigateTo } = useApp()
+
+  /** Push an entity onto the shared engagement canvas. */
+  function addToCanvas(entity) {
+    const n = canvas.add({
+      arn: entity.arn, label: entity.label, node_type: entity.node_type,
+      principal_type: entity.principal_type, service: entity.service,
+      resource_type: entity.resource_type, account_id: entity.account_id,
+      risk: entity.risk,
+    })
+    showToast?.(n
+      ? `Added ${entity.label} to the engagement graph`
+      : `${entity.label} is already on the engagement graph`)
+  }
+
 
   const [tab, setTab] = useState('All')
   const [riskFilter, setRiskFilter] = useState('All Risk')
   const [search, setSearch] = useState('')
   const [debouncedSearch, setDebouncedSearch] = useState('')
   const [selected, setSelected] = useState(null)
+  const {
+    width: detailWidth, resizing: detailResizing,
+    onResizeDown: onDetailResize, panelRef: detailRef,
+  } = useResizableWidth({
+    initial: 420, min: 340, side: 'right',
+    max: () => Math.max(340, window.innerWidth - 80),  // never under the nav rail
+  })
   const [serviceFilter, setServiceFilter] = useState('All')
   const [selectedPerms, setSelectedPerms] = useState([])
   const [permQuery, setPermQuery] = useState('')
@@ -491,20 +446,28 @@ export default function EntitiesPage() {
             style={{ position: 'fixed', inset: 0, zIndex: 499 }}
             onClick={() => setSelected(null)}
           />
-          <div style={{
+          <div ref={detailRef} style={{
             position: 'fixed', top: 0, right: 0, bottom: 0,
-            width: '420px',
+            width: `${detailWidth}px`,
             zIndex: 500,
-            overflowY: 'auto',
+            display: 'flex',
             background: 'var(--bg1)',
-            borderLeft: '1px solid var(--border2)',
             boxShadow: '-4px 0 24px rgba(0,0,0,0.5)',
           }}>
+            <ResizeHandle onPointerDown={onDetailResize} active={detailResizing} side="left" />
             <EntityDetailPanel
               entity={selected}
               findings={findings}
               onClose={() => setSelected(null)}
-              onViewGraph={handleViewGraph}
+              actions={[
+                { label: '＋ Add to canvas', variant: 'primary', grow: true,
+                  title: 'Add to the shared engagement graph',
+                  onClick: () => addToCanvas(selected) },
+                { label: 'Open canvas', title: 'Go to the Threat Model page',
+                  onClick: () => navigateTo('threatmodel') },
+                { label: '⬡ Structure', title: 'Explore the structural graph',
+                  onClick: () => handleViewGraph(selected) },
+              ]}
             />
           </div>
         </>

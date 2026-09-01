@@ -10,98 +10,20 @@
  *  pathSteps  – array of _ap_step objects {actor_arn, target_arn, action, edge_type}
  *  onClose    – close callback
  */
-import { useEffect, useRef, useState, useCallback } from 'react'
+import { useEffect, useRef, useState } from 'react'
 import cytoscape from 'cytoscape'
 import { api } from '../api'
 import EntityDetailPanel from './EntityDetailPanel'
 import { useApp } from '../context/AppContext'
-
-// ─── Type config ──────────────────────────────────────────────────────────────
-
-const NODE_CFG = {
-  role: { shape: 'round-rectangle', icon: '⚙', color: '#3a9ab0' },
-  principal: { shape: 'round-rectangle', icon: '⚙', color: '#3a9ab0' },
-  user: { shape: 'ellipse', icon: '👤', color: '#3dab6e' },
-  group: { shape: 'ellipse', icon: '👥', color: '#9a7fc8' },
-  policy: { shape: 'round-rectangle', icon: '📄', color: '#c878b0' },
-  resource: { shape: 'round-rectangle', icon: '☁', color: '#d97c14' },
-  account: { shape: 'ellipse', icon: '🔷', color: '#6070a0' },
-  external: { shape: 'ellipse', icon: '⚡', color: '#4e5668' },
-}
-const DEFAULT_CFG = { shape: 'ellipse', icon: '●', color: '#4e5668' }
-
-function resolveType(n) { return n?.principal_type || n?.node_type || 'role' }
-function cfgFor(n) { return NODE_CFG[resolveType(n)] || DEFAULT_CFG }
-
-function arnType(arn = '') {
-  if (arn.includes(':role/') || arn.includes('assumed-role')) return 'role'
-  if (arn.includes(':user/')) return 'user'
-  if (arn.includes(':group/')) return 'group'
-  if (arn.includes(':policy/')) return 'policy'
-  return 'resource'
-}
-
-function shortLabel(id = '') {
-  const a = id.replace(/^[^:]+:/, '')
-  const p = a.split('/').pop() || a.split(':').pop() || id
-  return p.length > 22 ? p.slice(0, 21) + '…' : p
-}
-
-function emojiSvgUrl(emoji) {
-  const svg = `<svg xmlns="http://www.w3.org/2000/svg" width="64" height="64"><text x="32" y="44" font-size="38" text-anchor="middle">${emoji}</text></svg>`
-  return `data:image/svg+xml;charset=utf-8,${encodeURIComponent(svg)}`
-}
-
-function makeData(n) {
-  const nid = n.id || n.node_id
-  const cfg = cfgFor(n)
-  return {
-    id: nid,
-    label: shortLabel(n.label || nid),
-    iconUrl: emojiSvgUrl(cfg.icon),
-    nodeType: resolveType(n),
-    typeColor: cfg.color,
-    typeShape: cfg.shape,
-    fullLabel: n.label || shortLabel(nid),
-    arn: n.arn,
-    account_id: n.account_id,
-    node_type: n.node_type,
-    principal_type: n.principal_type,
-    policy_type: n.policy_type,
-    service: n.service,
-    resource_type: n.resource_type,
-    region: n.region,
-    actions: n.actions || [],
-    trust_principals: n.trust_principals || [],
-    policies: n.policies || [],
-    attached_principals: n.attached_principals || [],
-    execution_role: n.execution_role || null,
-    metadata: n.metadata || null,
-  }
-}
-
-function dataToEntity(d) {
-  return {
-    label: d.fullLabel,
-    arn: d.arn,
-    node_type: d.node_type,
-    principal_type: d.principal_type,
-    policy_type: d.policy_type,
-    account_id: d.account_id,
-    actions: d.actions || [],
-    trust_principals: d.trust_principals || [],
-    policies: d.policies || [],
-    attached_principals: d.attached_principals || [],
-    execution_role: d.execution_role || null,
-    service: d.service,
-    resource_type: d.resource_type,
-    region: d.region,
-    metadata: d.metadata || null,
-  }
-}
-
-// Network-topology edge types (built from resource metadata in graph_store)
-const NETWORK_EDGE_LABELS = { in_vpc: 'in vpc', in_subnet: 'in subnet', uses_sg: 'uses sg' }
+import {
+  NODE_CFG, arnType, cfgFor, shortLabel, iconSvgUrl, makeData, dataToEntity,
+  NETWORK_EDGE_LABELS, baseStylesheet, typeGradientStyles,
+  PATH_LAYOUT, pickLayout,
+} from './graphShared'
+import ControlsPanel from './GraphControls'
+import ResizeHandle from './ResizeHandle'
+import NodeTypeIcon from './NodeTypeIcon'
+import { useResizableWidth } from './useResizableWidth'
 
 // Build cytoscape elements directly from path steps (no API call)
 function pathStepsToElements(steps) {
@@ -118,7 +40,7 @@ function pathStepsToElements(steps) {
           data: {
             id: arn,
             label: shortLabel(arn),
-            iconUrl: emojiSvgUrl(cfg.icon),
+            iconUrl: iconSvgUrl(t),
             nodeType: t,
             typeColor: cfg.color,
             typeShape: cfg.shape,
@@ -155,62 +77,8 @@ function pathStepsToElements(steps) {
 // ─── Cytoscape stylesheet ─────────────────────────────────────────────────────
 
 function buildStylesheet(nodeSize, edgeOpacity) {
-  const styles = [
-    {
-      selector: 'node',
-      style: {
-        'width': nodeSize,
-        'height': nodeSize,
-        'background-image': 'data(iconUrl)',
-        'background-width': '60%',
-        'background-height': '60%',
-        'background-clip': 'node',
-        'background-position-x': '50%',
-        'background-position-y': '50%',
-        'background-color': '#0b0d12',
-        'background-opacity': 1,
-        'border-width': 1.5,
-        'border-opacity': 0.70,
-        'border-color': 'data(typeColor)',
-        'shape': 'data(typeShape)',
-        'label': 'data(label)',
-        'text-valign': 'bottom',
-        'text-halign': 'center',
-        'text-margin-y': 5,
-        'font-size': 9,
-        'font-family': 'IBM Plex Mono, monospace',
-        'color': 'rgba(196,202,212,0.85)',
-        'text-wrap': 'none',
-        'overlay-opacity': 0,
-      },
-    },
-    {
-      selector: 'node:selected',
-      style: {
-        'border-width': 2.5,
-        'border-opacity': 1,
-        'shadow-blur': 20,
-        'shadow-opacity': 0.80,
-        'shadow-color': 'data(typeColor)',
-        'shadow-offset-x': 0,
-        'shadow-offset-y': 0,
-        'overlay-opacity': 0,
-      },
-    },
-    {
-      selector: 'edge',
-      style: {
-        'width': 1,
-        'line-color': `rgba(55,60,78,${edgeOpacity})`,
-        'target-arrow-color': `rgba(55,60,78,${edgeOpacity})`,
-        'target-arrow-shape': 'triangle',
-        'curve-style': 'bezier',
-        'arrow-scale': 0.6,
-        'opacity': edgeOpacity,
-        'overlay-opacity': 0,
-      },
-    },
-    { selector: 'edge:selected', style: { 'width': 2, 'opacity': 1 } },
+  return [
+    ...baseStylesheet(nodeSize, edgeOpacity),
     // Path edges — amber, dashed, labelled with IAM action
     {
       selector: 'edge[edgeType = "path"]',
@@ -224,12 +92,6 @@ function buildStylesheet(nodeSize, edgeOpacity) {
         'curve-style': 'bezier',
         'arrow-scale': 0.8,
         'opacity': 1,
-        'label': 'data(label)',
-        'font-size': 8,
-        'font-family': 'IBM Plex Mono, monospace',
-        'color': '#d97c14',
-        'text-rotation': 'autorotate',
-        'text-margin-y': -8,
         'overlay-opacity': 0,
       },
     },
@@ -244,130 +106,16 @@ function buildStylesheet(nodeSize, edgeOpacity) {
         'curve-style': 'bezier',
         'arrow-scale': 0.7,
         'opacity': 0.9,
-        'label': 'data(label)',
-        'font-size': 7,
-        'font-family': 'IBM Plex Mono, monospace',
-        'color': '#3fb8a8',
-        'text-rotation': 'autorotate',
-        'text-margin-y': -6,
         'overlay-opacity': 0,
       },
     },
+    { selector: 'edge.hovered', style: { 'width': 3.5, 'opacity': 1, 'z-index': 99 } },
+    ...typeGradientStyles(),
   ]
-
-  // Per-type glass gradient
-  Object.entries(NODE_CFG).forEach(([type, cfg]) => {
-    styles.push({
-      selector: `node[nodeType = "${type}"]`,
-      style: {
-        'background-fill': 'linear-gradient',
-        'background-gradient-stop-colors': `${cfg.color} #080a0e`,
-        'background-gradient-stop-positions': '0 100',
-        'background-gradient-direction': 'to-bottom-right',
-        'background-opacity': 0.50,
-      },
-    })
-  })
-
-  return styles
 }
 
-// ─── Layout configs ───────────────────────────────────────────────────────────
-
-const CIRCLE_LAYOUT = {
-  name: 'circle',
-  fit: true,
-  padding: 80,
-  animate: false,
-  avoidOverlap: true,
-  radius: undefined,
-  startAngle: (3 / 2) * Math.PI,
-  counterclockwise: false,
-  nodeDimensionsIncludeLabels: true,
-}
-
-const COSE_LAYOUT = {
-  name: 'cose',
-  animate: false,
-  fit: true,
-  padding: 80,
-  nodeRepulsion: () => 4500,
-  idealEdgeLength: () => 150,
-  edgeElasticity: () => 0.45,
-  gravity: 0.8,
-  numIter: 1000,
-  initialTemp: 200,
-  coolingFactor: 0.99,
-  minTemp: 1.0,
-  randomize: true,
-  nodeOverlap: 40,
-}
-
-// Directed hierarchical layout for attack path visualization
-const PATH_LAYOUT = {
-  name: 'breadthfirst',
-  directed: true,
-  fit: true,
-  padding: 80,
-  animate: false,
-  avoidOverlap: true,
-  spacingFactor: 2.5,
-}
-
-function pickLayout(n, isPath) {
-  if (isPath) return PATH_LAYOUT
-  return n <= 30 ? CIRCLE_LAYOUT : COSE_LAYOUT
-}
-
-// ─── Controls panel ───────────────────────────────────────────────────────────
-
-function ControlsPanel({ cyRef, open, onToggle, nodeSize, setNodeSize, edgeOpacity, setEdgeOpacity, onRelayout, onClear }) {
-  const base = { width: 28, height: 28, background: 'var(--bg2)', border: '1px solid var(--border2)', borderRadius: '3px', cursor: 'pointer', color: 'var(--text-dim)', fontSize: '13px', fontFamily: 'IBM Plex Mono,monospace', display: 'flex', alignItems: 'center', justifyContent: 'center', transition: 'all 0.12s' }
-  const enter = e => { e.currentTarget.style.background = 'var(--bg3)'; e.currentTarget.style.color = 'var(--text)' }
-  const leave = e => { e.currentTarget.style.background = 'var(--bg2)'; e.currentTarget.style.color = 'var(--text-dim)' }
-
-  function zoom(factor) {
-    const cy = cyRef.current; if (!cy) return
-    cy.zoom({ level: cy.zoom() * factor, renderedPosition: { x: cy.width() / 2, y: cy.height() / 2 } })
-  }
-
-  return (
-    <div style={{ position: 'absolute', top: 12, right: 12, zIndex: 10, display: 'flex', flexDirection: 'column', alignItems: 'flex-end', gap: 4 }}>
-      <div style={{ display: 'flex', flexDirection: 'column', gap: 4 }}>
-        {[
-          { l: '+', title: 'Zoom in', fn: () => zoom(1.3) },
-          { l: '−', title: 'Zoom out', fn: () => zoom(0.77) },
-          { l: '⊙', title: 'Fit view', fn: () => cyRef.current?.fit(undefined, 60) },
-          { l: '⟳', title: 'Re-layout', fn: onRelayout },
-          { l: '🗑', title: 'Clear graph', fn: onClear },
-        ].map(({ l, title, fn }) => (
-          <button key={l} title={title} onClick={fn} style={base} onMouseEnter={enter} onMouseLeave={leave}>{l}</button>
-        ))}
-        <div style={{ height: 1, background: 'var(--border)', margin: '2px 0' }} />
-        <button title="Controls" onClick={onToggle}
-          style={{ ...base, background: open ? 'var(--amber-glow)' : 'var(--bg2)', border: `1px solid ${open ? 'rgba(217,124,20,.3)' : 'var(--border2)'}`, color: open ? 'var(--amber)' : 'var(--text-dim)', fontSize: '11px' }}>⛭</button>
-      </div>
-      {open && (
-        <div style={{ background: 'var(--bg1)', border: '1px solid var(--border2)', borderRadius: '4px', padding: '10px 12px', width: '160px', display: 'flex', flexDirection: 'column', gap: '10px' }}>
-          {[
-            { label: 'Node size', value: nodeSize, min: 14, max: 60, step: 2, fmt: v => `${v}px`, set: setNodeSize },
-            { label: 'Edge alpha', value: edgeOpacity, min: 0.05, max: 1, step: 0.05, fmt: v => `${Math.round(v * 100)}%`, set: setEdgeOpacity },
-          ].map(({ label, value, min, max, step, fmt, set }) => (
-            <div key={label}>
-              <div style={{ display: 'flex', justifyContent: 'space-between', fontSize: '10px', color: 'var(--text-dim)', marginBottom: '3px' }}>
-                <span>{label}</span>
-                <span style={{ color: 'var(--amber)', fontFamily: 'IBM Plex Mono' }}>{fmt(value)}</span>
-              </div>
-              <input type="range" min={min} max={max} step={step} value={value}
-                onChange={e => set(Number(e.target.value))}
-                style={{ width: '100%', accentColor: 'var(--amber)' }} />
-            </div>
-          ))}
-        </div>
-      )}
-    </div>
-  )
-}
+const NAV_W = 56        // the fixed nav rail, --nav-w
+const MIN_GRAPH_W = 320 // never squeeze the canvas below this
 
 // ─── Main component ────────────────────────────────────────────────────────────
 
@@ -380,14 +128,27 @@ export default function GraphViewer({ nodeIds = [], pathSteps = [], focusNodeId 
   useEffect(() => { ensureEntities?.().catch(() => {}) }, [ensureEntities])
   const containerRef = useRef(null)
   const cyRef = useRef(null)
-  const panelRef = useRef(null)
   // Nodes the user explicitly removed — never re-added on subsequent loads
   const removedRef = useRef(new Set())
 
   const isPathMode = pathSteps?.length > 0
 
-  const [width, setWidth] = useState(Math.min(window.innerWidth * 0.65, 1100))
-  const [resizing, setResizing] = useState(false)
+  const { width, resizing, onResizeDown, panelRef } = useResizableWidth({
+    initial: Math.min(window.innerWidth * 0.65, 1100), min: 360, side: 'right',
+  })
+  // The detail panel needs its own width. Without one it is sized by its
+  // content, which on the Risk tab (long finding messages) grows unbounded.
+  const detail = useResizableWidth({
+    initial: 420, min: 340, side: 'right',
+    max: () => Math.max(340, window.innerWidth - NAV_W - MIN_GRAPH_W),
+  })
+  const [viewportW, setViewportW] = useState(window.innerWidth)
+  useEffect(() => {
+    const onResize = () => setViewportW(window.innerWidth)
+    window.addEventListener('resize', onResize)
+    return () => window.removeEventListener('resize', onResize)
+  }, [])
+
   const [loading, setLoading] = useState(false)
   const [error, setError] = useState(null)
   const [selected, setSelected] = useState(null)
@@ -398,21 +159,32 @@ export default function GraphViewer({ nodeIds = [], pathSteps = [], focusNodeId 
   const [nodeSize, setNodeSize] = useState(26)
   const [edgeOpacity, setEdgeOpacity] = useState(isPathMode ? 1 : 0.6)
   const [ctxMenu, setCtxMenu] = useState(null)  // { x, y, id, label }
+  const [edgeHover, setEdgeHover] = useState(null)
 
-  // ── Resize ─────────────────────────────────────────────────────────────────
+  // The graph and the detail panel sit side by side. When both cannot fit, the
+  // graph yields — previously the panel simply ran off the left edge and under
+  // the nav rail.
+  const detailW = selected ? detail.width : 0
+  const graphW = Math.max(
+    MIN_GRAPH_W, Math.min(width, viewportW - NAV_W - detailW))
 
-  const startX = useRef(0), startW = useRef(0)
-  const onResizeDown = useCallback((e) => {
-    startX.current = e.clientX; startW.current = panelRef.current?.offsetWidth ?? width
-    setResizing(true); e.preventDefault()
-  }, [width])
+  // Cytoscape does not observe its container, so it has to be told when the
+  // canvas changes size or it keeps rendering at the old dimensions.
   useEffect(() => {
-    if (!resizing) return
-    const move = e => setWidth(Math.max(360, Math.min(window.innerWidth * 0.93, startW.current + (startX.current - e.clientX))))
-    const up = () => setResizing(false)
-    window.addEventListener('mousemove', move); window.addEventListener('mouseup', up)
-    return () => { window.removeEventListener('mousemove', move); window.removeEventListener('mouseup', up) }
-  }, [resizing])
+    const cy = cyRef.current
+    if (!cy) return
+    const t = setTimeout(() => cy.resize(), 0)
+    return () => clearTimeout(t)
+  }, [graphW])
+
+  // Re-fit only when the panel opens or closes, not while it is being dragged —
+  // refitting on every pointer move would fight the analyst for the viewport.
+  useEffect(() => {
+    const cy = cyRef.current
+    if (!cy || !cy.nodes().length) return
+    const t = setTimeout(() => { cy.resize(); cy.fit(undefined, 60) }, 60)
+    return () => clearTimeout(t)
+  }, [!!selected])
 
   // ── Init Cytoscape ─────────────────────────────────────────────────────────
 
@@ -443,7 +215,21 @@ export default function GraphViewer({ nodeIds = [], pathSteps = [], focusNodeId 
       const pos = evt.renderedPosition || { x: 0, y: 0 }
       setCtxMenu({ x: pos.x, y: pos.y, id: d.id, label: d.fullLabel || d.label })
     })
-    cy.on('pan zoom', () => setCtxMenu(null))
+    // Edges are no longer drawn with a rotated label; hovering reveals it
+    // horizontally instead, where it is actually legible.
+    cy.on('mouseover', 'edge', evt => {
+      const d = evt.target.data()
+      if (!d.label && !d.edgeType) return
+      evt.target.addClass('hovered')
+      const pos = evt.renderedPosition || { x: 0, y: 0 }
+      setEdgeHover({ x: pos.x, y: pos.y, label: d.label,
+                     edgeType: d.edgeType, source: d.source, target: d.target })
+    })
+    cy.on('mouseout', 'edge', evt => {
+      evt.target.removeClass('hovered')
+      setEdgeHover(null)
+    })
+    cy.on('pan zoom', () => { setCtxMenu(null); setEdgeHover(null) })
     cyRef.current = cy
     return () => cy.destroy()
   }, [])
@@ -587,47 +373,37 @@ export default function GraphViewer({ nodeIds = [], pathSteps = [], focusNodeId 
 
       {/* Entity detail — sits to the LEFT of the graph panel, never inside/overlapping the canvas */}
       {selected && (
-        <div style={{
+        <div ref={detail.panelRef} style={{
           position: 'fixed', top: 0, bottom: 0,
-          right: `${Math.min(width, window.innerWidth * 0.93)}px`,
-          maxWidth: 'calc(100vw - 56px)',  // never overflow behind nav rail
+          right: `${graphW}px`,
+          width: `${detailW}px`,
           zIndex: 1001,
-          overflowY: 'auto',
+          display: 'flex',
           background: 'var(--bg1)',
-          borderLeft: '1px solid var(--border2)',
           boxShadow: '-4px 0 24px rgba(0,0,0,0.5)',
         }}>
+          <ResizeHandle onPointerDown={detail.onResizeDown}
+            active={detail.resizing} side="left" />
           <EntityDetailPanel
             entity={selected}
             findings={findings}
             onClose={() => { setSelected(null); setSelectedId(null); cyRef.current?.nodes().unselect() }}
-            onViewGraph={null}
+            actions={isPathMode ? [] : [
+              { label: '⊕ Expand neighbors', variant: 'primary', grow: true,
+                onClick: () => expandNode(selectedId) },
+              { label: '✕ Remove', variant: 'danger',
+                title: 'Remove this node from the graph',
+                onClick: () => removeNode(selectedId) },
+            ]}
           />
-          {!isPathMode && (
-            <div style={{ padding: '8px 12px', borderTop: '1px solid var(--border)', display: 'flex', gap: '8px' }}>
-              <button className="btn primary sm" style={{ flex: 1, justifyContent: 'center' }}
-                onClick={() => expandNode(selectedId)}>
-                ⊕ Expand neighbors
-              </button>
-              <button className="btn secondary sm" title="Remove this node from the graph"
-                style={{ justifyContent: 'center', color: 'var(--red-hi)', borderColor: 'rgba(192,48,48,.3)' }}
-                onClick={() => removeNode(selectedId)}>
-                ✕ Remove
-              </button>
-            </div>
-          )}
         </div>
       )}
 
       <div ref={panelRef} className="graph-slideover"
-        style={{ width: `${width}px`, display: 'flex', flexDirection: 'column', maxWidth: '93vw' }}>
+        style={{ width: `${graphW}px`, display: 'flex', flexDirection: 'column' }}>
 
         {/* Resize handle */}
-        <div onMouseDown={onResizeDown}
-          style={{ position: 'absolute', left: 0, top: 0, bottom: 0, width: '6px', cursor: 'ew-resize', zIndex: 10, background: resizing ? 'var(--amber)' : 'transparent', transition: 'background 0.15s' }}
-          onMouseEnter={e => { e.currentTarget.style.background = 'rgba(217,124,20,0.3)' }}
-          onMouseLeave={e => { if (!resizing) e.currentTarget.style.background = 'transparent' }}
-        />
+        <ResizeHandle onPointerDown={onResizeDown} active={resizing} side="left" />
 
         {/* Header */}
         <div className="slideover-header">
@@ -680,6 +456,33 @@ export default function GraphViewer({ nodeIds = [], pathSteps = [], focusNodeId 
                 onNodeIdsChange?.([])
               }}
             />
+            {/* Edge hover card */}
+            {edgeHover && (
+              <div style={{
+                position: 'absolute', left: edgeHover.x + 12, top: edgeHover.y + 12,
+                zIndex: 30, pointerEvents: 'none', maxWidth: 320,
+                background: 'var(--bg1)', border: '1px solid var(--border2)',
+                borderRadius: '4px', boxShadow: '0 6px 20px rgba(0,0,0,0.55)',
+                padding: '6px 10px',
+              }}>
+                <div style={{ fontSize: '9px', color: 'var(--text-faint)',
+                              whiteSpace: 'nowrap', overflow: 'hidden',
+                              textOverflow: 'ellipsis' }}>
+                  {shortLabel(edgeHover.source)} → {shortLabel(edgeHover.target)}
+                </div>
+                {edgeHover.label && (
+                  <div style={{ fontSize: '10px', color: 'var(--text)', marginTop: 3,
+                                fontFamily: 'IBM Plex Mono, monospace',
+                                wordBreak: 'break-word' }}>{edgeHover.label}</div>
+                )}
+                {edgeHover.edgeType && edgeHover.edgeType !== 'path' && (
+                  <div style={{ fontSize: '9px', color: 'var(--text-faint)', marginTop: 2 }}>
+                    {edgeHover.edgeType.replace(/_/g, ' ')}
+                  </div>
+                )}
+              </div>
+            )}
+
             {/* Node context menu (right-click) */}
             {ctxMenu && (
               <div style={{
@@ -717,9 +520,13 @@ export default function GraphViewer({ nodeIds = [], pathSteps = [], focusNodeId 
                   <span style={{ color: '#3fb8a8' }}>network link</span>
                 </div>
               )}
-              {[['Role', '⚙', '#3a9ab0'], ['User', '👤', '#3dab6e'], ['Group', '👥', '#9a7fc8'], ['Policy', '📄', '#c878b0'], ['Resource', '☁', '#d97c14'], ['Account', '🔷', '#6070a0']].map(([lbl, icon, col]) => (
+              {/* Driven from NODE_CFG so the legend and the canvas glyphs stay in step. */}
+              {[['Role', 'role'], ['User', 'user'], ['Group', 'group'],
+                ['Policy', 'policy'], ['Resource', 'resource'], ['Account', 'account']]
+                .map(([lbl, key]) => (
                 <div key={lbl} style={{ display: 'flex', alignItems: 'center', gap: '5px', fontSize: '10px', color: 'var(--text-dim)' }}>
-                  <span style={{ fontSize: '11px' }}>{icon}</span><span style={{ color: col }}>{lbl}</span>
+                  <NodeTypeIcon type={key} />
+                  <span style={{ color: NODE_CFG[key].color }}>{lbl}</span>
                 </div>
               ))}
             </div>

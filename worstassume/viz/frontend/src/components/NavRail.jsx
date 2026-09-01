@@ -36,11 +36,22 @@ function IconPrivEsc() {
   )
 }
 
+function IconThreatModel() {
+  return (
+    <svg width="18" height="18" viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="1.4">
+      <circle cx="8" cy="8" r="2"/>
+      <circle cx="8" cy="8" r="6.5"/>
+      <path d="M8 1.5v2M8 12.5v2M1.5 8h2M12.5 8h2" strokeLinecap="round"/>
+    </svg>
+  )
+}
+
 const ITEMS = [
   { id: 'dashboard',  Icon: IconDashboard,  label: 'Dashboard'  },
   { id: 'entities',   Icon: IconEntities,   label: 'Entities'   },
   { id: 'assessment', Icon: IconAssessment, label: 'Assessment' },
   { id: 'privesc',    Icon: IconPrivEsc,    label: 'PrivEsc'    },
+  { id: 'threatmodel', Icon: IconThreatModel, label: 'Threat Model' },
 ]
 
 export default function NavRail({ page, setPage, critCount = 0, findingCount = 0 }) {

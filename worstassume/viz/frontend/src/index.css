@@ -1023,7 +1023,9 @@ body::after {
   position: fixed;
   right: 0; top: 0; bottom: 0;
   width: 65vw;
-  min-width: 400px;
+  /* Width is driven by JS so the canvas can yield room to the detail panel;
+     a hard min-width here would stop it shrinking. */
+  min-width: 320px;
   background: var(--bg1);
   border-left: 1px solid var(--border);
   display: flex;
@@ -1031,8 +1033,6 @@ body::after {
   z-index: 201;
   box-shadow: var(--shadow);
   animation: slide-in 0.18s ease;
-  resize: horizontal;
-  overflow: auto;
 }
 
 .graph-resize-handle {
@@ -1214,9 +1214,14 @@ body::after {
   border-left: 1px solid var(--border);
   display: flex;
   flex-direction: column;
-  overflow-y: auto;
-  overflow-x: hidden;
+  /* The tab body owns the scroll; scrolling here too would nest two
+     scrollbars and detach the sticky header from the tab bar. */
+  overflow: hidden;
+  min-width: 0;
 }
+/* Children of the flex column must be allowed to shrink, or long unbreakable
+   content (ARNs, JSON) widens the whole panel. */
+.ent-sidebar > * { min-width: 0; max-width: 100%; }
 .ent-sidebar::-webkit-scrollbar { width: 3px; }
 .ent-sidebar::-webkit-scrollbar-thumb { background: var(--border2); }
 
@@ -1306,6 +1311,23 @@ body::after {
 .action-chip.high     { background: var(--amber-glow);  color: var(--amber-hi);  border-color: rgba(217,124,20,.25); }
 .action-chip.medium   { background: rgba(184,160,32,.08); color: var(--yellow-hi); border-color: rgba(184,160,32,.2); }
 .action-chip.normal   { background: var(--bg3);          color: var(--text-dim);  border-color: var(--border2); }
+
+/* Emitted by the sidebar's Risk tab; previously had no rule at all. */
+.sb-path-row {
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+  padding: 6px 0;
+  border-bottom: 1px solid var(--border);
+}
+.sb-path-row:last-child { border-bottom: none; }
+
+.policy-type.inline-label { color: var(--amber); }
+
+/* Four or five tabs have to fit at the sidebar's 320px minimum, so tighten the
+   shared .tab-btn padding here rather than everywhere. */
+.ent-sidebar .tab-bar { position: sticky; top: 0; z-index: 9; background: var(--bg1); }
+.ent-sidebar .tab-btn { padding: 8px 10px; }
 
 .sb-actions {
   display: flex;

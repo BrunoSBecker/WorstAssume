@@ -7,6 +7,7 @@ Uses moto to mock IAM and provides a real in-memory DB session.
 from __future__ import annotations
 
 import json
+from unittest.mock import MagicMock
 
 import boto3
 import pytest
@@ -29,6 +30,7 @@ def _cap_full() -> CapabilityMap:
         iam_full_dump=True,
         iam_list_roles=True,
         iam_list_users=True,
+        iam_list_groups=True,
         iam_list_policies=True,
     )
 
@@ -39,6 +41,7 @@ def _cap_slow() -> CapabilityMap:
         iam_full_dump=False,
         iam_list_roles=True,
         iam_list_users=True,
+        iam_list_groups=True,
         iam_list_policies=True,
     )
 
@@ -52,6 +55,32 @@ def _cap_none() -> CapabilityMap:
 
 @mock_aws
 class TestIAMFastPath:
+    def test_reuses_first_dump_page_from_capability_probe(self, db_session):
+        account = get_or_create_account(db_session, "123456789012")
+        db_session.commit()
+        cap = _cap_full()
+        cap._iam_dump_first_page = {
+            "UserDetailList": [{
+                "Arn": "arn:aws:iam::123456789012:user/probed",
+                "UserName": "probed",
+                "UserPolicyList": [],
+                "AttachedManagedPolicies": [],
+                "GroupList": [],
+            }],
+            "GroupDetailList": [],
+            "RoleDetailList": [],
+            "Policies": [],
+            "IsTruncated": False,
+        }
+        iam = MagicMock()
+        session = MagicMock(spec=SessionManager)
+        session.client.return_value = iam
+
+        iam_module.enumerate(session, db_session, account, cap)
+
+        iam.get_account_authorization_details.assert_not_called()
+        assert db_session.query(Principal).filter_by(name="probed").one()
+
     def test_enumerates_users_via_fast_path(self, db_session):
         # Setup: create IAM user in moto
         iam = boto3.client("iam", region_name="us-east-1")

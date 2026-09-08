@@ -88,6 +88,31 @@ def upsert_principal(
     return obj
 
 
+def ensure_principal_stub(
+    session: Session,
+    account: Account,
+    arn: str,
+    name: str,
+    principal_type: str,
+) -> Principal:
+    """Persist a caller seed without overwriting richer enumerated data."""
+    obj = (
+        session.query(Principal)
+        .filter_by(account_id=account.id, arn=arn)
+        .first()
+    )
+    if obj is None:
+        obj = Principal(
+            account_id=account.id,
+            arn=arn,
+            name=name,
+            principal_type=principal_type,
+        )
+        session.add(obj)
+        session.flush()
+    return obj
+
+
 # ─── Policy ───────────────────────────────────────────────────────────────────
 
 def upsert_policy(

@@ -10,7 +10,7 @@ Given a set of AWS credentials, WorstAssume silently enumerates the IAM model, p
 
 | Capability | Details |
 |---|---|
-| **Adaptive enumeration** | Uses `iam:GetAccountAuthorizationDetails` when available; falls back to per-principal API calls |
+| **Adaptive enumeration** | Read-only waterfall: IAM dump → policy simulation → only unresolved inventory probes |
 | **Stealth mode** | Jittered API calls + call minimisation to reduce CloudTrail noise |
 | **Attack graph** | NetworkX-based multi-hop graph with 37 edge families (IAM, PassRole, resource abuse, lateral movement) |
 | **BFS path finding** | Configurable hop limit, multiple objective types (principal, permission, wildcard) |
@@ -178,6 +178,12 @@ worstassume/
 iam:GetAccountAuthorizationDetails
 ```
 
+The IAM dump replaces the IAM List probes. Resource permissions are evaluated
+separately. When `iam:SimulatePrincipalPolicy` is allowed, WorstAssume evaluates
+only read-only inventory actions in one batch and does not call service APIs
+that simulation denies. Otherwise it falls back to one minimal read-only probe
+per inventory capability.
+
 ### Minimum (slow-path fallback)
 ```
 iam:ListUsers               iam:ListRoles              iam:ListGroups
@@ -192,7 +198,14 @@ iam:GetPolicy               iam:GetPolicyVersion       iam:ListGroupsForUser
 ec2:DescribeInstances       lambda:ListFunctions       ecs:ListClusters
 ecs:ListTaskDefinitions     s3:ListAllMyBuckets        s3:GetBucketPolicy
 ec2:DescribeVpcs            ec2:DescribeSecurityGroups
+ec2:DescribeSubnets         ec2:DescribeInternetGateways
+ec2:DescribeNatGateways     ec2:DescribeRouteTables
 ```
+
+The STS caller is always retained as a principal seed. If none of these
+inventory reads is available, enumeration finishes successfully with an empty
+inventory and an explicit CLI notice. WorstAssume never uses Create/Put calls
+as permission oracles.
 
 ---
 

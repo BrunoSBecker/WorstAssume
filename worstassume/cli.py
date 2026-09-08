@@ -67,7 +67,10 @@ def enumerate(
 
     from worstassume.session import SessionManager
     from worstassume.modules import identity as identity_mod
-    from worstassume.core.capability import probe_capabilities
+    from worstassume.core.capability import (
+        normalize_policy_source_arn,
+        probe_capabilities,
+    )
     from worstassume.modules import iam, ec2, s3, lambda_, ecs, vpc
     from worstassume.db import store
 
@@ -104,6 +107,18 @@ def enumerate(
         account = store.get_or_create_account(
             db, identity.account_id, account_name=account_name, profile=profile
         )
+        # STS is always available for a valid credential. Persist a canonical
+        # IAM role ARN for assumed-role sessions so a read-constrained key still
+        # leaves a stable principal seed for offline graph/path analysis.
+        caller_arn = normalize_policy_source_arn(identity.arn)
+        caller_type = "role" if identity.principal_type == "assumed-role" else identity.principal_type
+        store.ensure_principal_stub(
+            db,
+            account,
+            arn=caller_arn,
+            name=identity.principal_name,
+            principal_type=caller_type,
+        )
         run = store.start_run(db, account)
         db.commit()
 
@@ -115,6 +130,16 @@ def enumerate(
         cap_dict = cap.to_dict()
         allowed = [k for k, v in cap_dict.items() if v]
         console.print(f"[bold green]✓[/bold green] Capabilities detected: [cyan]{', '.join(allowed) or 'none'}[/cyan]")
+        status = cap.status_groups()
+        if status["denied"]:
+            console.print(f"  [dim]Denied: {', '.join(status['denied'])}[/dim]")
+        if status["skipped"]:
+            console.print(f"  [dim]Skipped: {', '.join(status['skipped'])}[/dim]")
+        if not any(v for k, v in cap_dict.items() if k != "iam_simulate"):
+            console.print(
+                "[yellow]No readable inventory permissions were found. "
+                "The caller was recorded, and resource enumeration will be skipped.[/yellow]"
+            )
 
         # ── 5. Enumeration ─────────────────────────────────────────────────────
         modules_run = []
@@ -151,6 +176,7 @@ def enumerate(
         console.rule()
         console.print(f"[bold green]✓ Enumeration complete.[/bold green]  DB: [dim]{get_db_path()}[/dim]")
         console.print(f"  Modules run: {', '.join(modules_run)}")
+        console.print(f"  AWS calls: [cyan]{session.call_count}[/cyan]")
         console.print(f"  Run [bold]worst viz[/bold] to explore the graph in your browser.")
 
     except Exception as e:

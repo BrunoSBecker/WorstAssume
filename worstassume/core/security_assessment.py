@@ -19,6 +19,7 @@ from datetime import datetime, timezone
 
 from sqlalchemy.orm import Session
 
+from worstassume.core.iam_actions import _ALL_TRACKED_ACTIONS, _can_do
 from worstassume.db.models import Account, Principal, SecurityFinding
 from worstassume.db.store import upsert_security_finding
 
@@ -174,6 +175,48 @@ def _normalize_list(value) -> list:
     if value is None:
         return []
     return value if isinstance(value, list) else [value]
+
+
+def _can_do_ci(actions, action: str) -> bool:
+    """Case-insensitive wrapper around iam_actions._can_do()."""
+    lowered = {a.lower() for a in actions if isinstance(a, str)}
+    return _can_do(lowered, action.lower())
+
+
+def _effective_policies(p: Principal) -> list:
+    """Direct policies plus group-inherited policies for users."""
+    policies = list(p.policies)
+    for gm in getattr(p, "group_memberships_as_user", []):
+        if gm.group:
+            policies.extend(gm.group.policies)
+    return policies
+
+
+def _allow_stmt_actions(stmt: dict) -> set[str]:
+    """Lowercased actions granted by one Allow statement (Action or NotAction)."""
+    if "Action" in stmt:
+        return {a.lower() for a in _normalize_list(stmt.get("Action")) if isinstance(a, str)}
+    if "NotAction" in stmt:
+        excluded = {a.lower() for a in _normalize_list(stmt.get("NotAction")) if isinstance(a, str)}
+        granted: set[str] = set()
+        for candidate in _ALL_TRACKED_ACTIONS:
+            if "*" in candidate:
+                continue
+            if not _can_do_ci(excluded, candidate):
+                granted.add(candidate.lower())
+        return granted
+    return set()
+
+
+def _stmt_wildcard_verbs(stmt: dict) -> list[str]:
+    """Write/admin verbs granted on Resource:* by one Allow statement."""
+    resources = [r.lower() for r in _normalize_list(stmt.get("Resource")) if isinstance(r, str)]
+    if "*" not in resources:
+        return []
+    granted = _allow_stmt_actions(stmt)
+    if not granted:
+        return []
+    return sorted(v for v in DEFAULT_WRITE_VERBS if _can_do_ci(granted, v))
 
 
 def _is_service_linked_role(p: Principal) -> bool:
@@ -394,28 +437,31 @@ def _check_trust_policy(
 
 
 def _inline_risk(policies) -> tuple[str, str]:
-    """Assess inline policies. Returns (risk_level, reason)."""
+    """Assess inline policies. Returns (risk_level, reason).
+
+    Allow+NotAction is expanded via tracked actions; it is never treated as Action:*.
+    """
     risk, reason = "LOW", "read-only or tightly scoped policies"
     for pol in policies:
         doc = pol.document
         if not doc:
             continue
         for stmt in _normalize_list(doc.get("Statement", [])):
-            if stmt.get("Effect") != "Allow":
+            if not isinstance(stmt, dict) or stmt.get("Effect") != "Allow":
                 continue
-            actions   = _normalize_list(stmt.get("Action", []))
-            resources = _normalize_list(stmt.get("Resource", []))
-            if "*" in actions or actions == ["*"]:
+            actions   = _allow_stmt_actions(stmt)
+            resources = [r.lower() for r in _normalize_list(stmt.get("Resource")) if isinstance(r, str)]
+            if "*" in actions:
                 return "HIGH", "wildcard Action (*) in inline policy"
-            low = [a.lower() for a in actions]
-            if any(a in ("iam:*", "sts:*", "sts:assumerole") for a in low):
-                if "*" in resources:
+            if "*" in resources:
+                if any(_can_do_ci(actions, a) for a in ("iam:*", "sts:*", "sts:assumerole")):
                     return "HIGH", "iam:* or sts:AssumeRole on Resource: *"
-            write_kw = ["put", "create", "delete", "update", "invoke",
-                        "passrole", "full", "write", "start", "stop"]
-            action_str = " ".join(low)
-            if "*" in resources and any(kw in action_str for kw in write_kw):
-                risk, reason = "MEDIUM", "write actions on wildcard resources (inline)"
+                if any(_can_do_ci(actions, v) for v in _HIGH_SEVERITY_VERBS):
+                    return "HIGH", "IAM privilege-escalation actions on Resource: *"
+                write_kw = ("put", "create", "delete", "update", "invoke",
+                            "passrole", "full", "write", "start", "stop")
+                if any(any(kw in a for kw in write_kw) for a in actions):
+                    risk, reason = "MEDIUM", "write actions on wildcard resources (inline)"
     return risk, reason
 
 
@@ -425,11 +471,7 @@ def _assess_permissions(p: Principal) -> tuple[str, str]:
     For users, effective policies include those inherited from group memberships
     (via group_memberships_as_user), consistent with _collect_allowed_actions().
     """
-    # Build effective policy list: direct + group-inherited (for users)
-    effective_policies = list(p.policies)
-    for gm in getattr(p, "group_memberships_as_user", []):
-        if gm.group:
-            effective_policies.extend(gm.group.policies)
+    effective_policies = _effective_policies(p)
 
     attached_names = [
         pol.name for pol in effective_policies if pol.policy_type in ("managed", "aws_managed")
@@ -476,37 +518,62 @@ def _permissive_findings(
 
 
 def _check_resource_wildcards(p: Principal, cfg: SeverityConfig) -> list[_RawFinding]:
-    """Detect write/admin actions allowed on Resource: * in any attached policy."""
-    findings: list[_RawFinding] = []
-    seen: set[str] = set()
-    for pol in p.policies:
+    """Detect write/admin actions on Resource:* across direct and inherited policies.
+
+    One finding per principal (not one per verb) so an admin policy does not
+    produce a card storm. Severity is the worst verb; the message lists them.
+    """
+    matched: dict[str, str] = {}  # verb -> policy name
+    for pol in _effective_policies(p):
         doc = pol.document
         if not doc:
             continue
         for stmt in _normalize_list(doc.get("Statement", [])):
-            if stmt.get("Effect") != "Allow":
+            if not isinstance(stmt, dict) or stmt.get("Effect") != "Allow":
                 continue
-            resources = _normalize_list(stmt.get("Resource", []))
-            if "*" not in resources:
-                continue
-            actions = [a.lower() for a in _normalize_list(stmt.get("Action", []))]
-            matched = [a for a in actions if a in DEFAULT_WRITE_VERBS]
-            for action in matched:
-                path_id = f"ResourceWildcard:{action}"
-                if path_id in seen:
-                    continue  # one finding per unique action per principal
-                seen.add(path_id)
-                # Known IAM priv-esc primitives surface as HIGH so they are
-                # visible when the UI/CLI threshold is set to HIGH (the default).
-                default_sev = "HIGH" if action in _HIGH_SEVERITY_VERBS else "MEDIUM"
-                sev = cfg.resolve(path_id, default_sev)
-                findings.append(_RawFinding(
-                    entity_arn=p.arn, entity_type=p.principal_type, entity_name=p.name,
-                    category="RESOURCE_WILDCARD", path_id=path_id,
-                    severity=sev, original_severity=sev,
-                    message=f"Policy grants '{action}' on Resource: * — no resource scoping (policy: {pol.name})",
-                ))
-    return findings
+            for action in _stmt_wildcard_verbs(stmt):
+                matched.setdefault(action, pol.name)
+
+    if not matched:
+        return []
+
+    verbs = sorted(matched)
+    default_sev = "HIGH" if any(v in _HIGH_SEVERITY_VERBS for v in verbs) else "MEDIUM"
+    path_id = "ResourceWildcard"
+    sev = cfg.resolve(path_id, default_sev)
+    listed = ", ".join(verbs)
+    policy_names = sorted(set(matched.values()))
+    return [_RawFinding(
+        entity_arn=p.arn, entity_type=p.principal_type, entity_name=p.name,
+        category="RESOURCE_WILDCARD", path_id=path_id,
+        severity=sev, original_severity=sev,
+        message=(
+            f"Policy grants {len(verbs)} write/admin action(s) on Resource: * "
+            f"({listed}) — no resource scoping (policy: {', '.join(policy_names)})"
+        ),
+        principal_detail=listed,
+    )]
+
+
+def _fold_wildcards_into_privilege(
+    privilege_findings: list[_RawFinding],
+    wildcard_findings: list[_RawFinding],
+) -> list[_RawFinding]:
+    """Avoid a second HIGH card when privilege risk already explains Resource:* writes."""
+    if not wildcard_findings:
+        return privilege_findings
+    headline = next(
+        (f for f in privilege_findings if f.severity in ("HIGH", "CRITICAL")),
+        None,
+    )
+    if headline is None:
+        return privilege_findings + wildcard_findings
+    verbs = wildcard_findings[0].principal_detail
+    if verbs:
+        headline.message = f"{headline.message} — also grants on Resource:*: {verbs}"
+        if not headline.principal_detail:
+            headline.principal_detail = verbs
+    return privilege_findings
 
 
 # ─── Per-entity assessors ──────────────────────────────────────────────────────
@@ -521,6 +588,13 @@ def _assess_role(p: Principal, own_account: str, cfg: SeverityConfig) -> list[_R
     # Apply permission-risk downgrade to trust findings
     perm_risk, perm_reason = _assess_permissions(p)
     for f in trust_findings:
+        f.perm_risk = perm_risk
+        # Internet-open and unconditioned external-root trust stay CRITICAL
+        # even when the role currently looks low-privilege.
+        if f.path_id == "WildcardTrustNoCondition":
+            continue
+        if f.path_id == "ExternalAccountRootTrust" and f.original_severity == "CRITICAL":
+            continue
         new_sev = _TRUST_DOWNGRADE.get((f.severity, perm_risk), f.severity)
         if new_sev != f.severity:
             f.downgrade_note = (
@@ -528,12 +602,11 @@ def _assess_role(p: Principal, own_account: str, cfg: SeverityConfig) -> list[_R
                 f"permission risk ({perm_reason})"
             )
             f.severity = new_sev
-        f.perm_risk = perm_risk
 
     wildcard_findings = _check_resource_wildcards(p, cfg)
     perm_findings, _, _ = _permissive_findings(p, cfg)
 
-    return trust_findings + wildcard_findings + perm_findings
+    return trust_findings + _fold_wildcards_into_privilege(perm_findings, wildcard_findings)
 
 
 def _assess_user(p: Principal, cfg: SeverityConfig) -> list[_RawFinding]:
@@ -601,9 +674,9 @@ def _assess_user(p: Principal, cfg: SeverityConfig) -> list[_RawFinding]:
         except (ValueError, TypeError):
             pass
 
-    # Resource wildcard checks on users too
-    findings += _check_resource_wildcards(p, cfg)
-    return findings
+    privilege = [f for f in findings if f.path_id.startswith("UserPrivilege:")]
+    other = [f for f in findings if not f.path_id.startswith("UserPrivilege:")]
+    return other + _fold_wildcards_into_privilege(privilege, _check_resource_wildcards(p, cfg))
 
 
 def _assess_group(p: Principal, cfg: SeverityConfig) -> list[_RawFinding]:
@@ -619,8 +692,9 @@ def _assess_group(p: Principal, cfg: SeverityConfig) -> list[_RawFinding]:
             message=f"Group grants {perm_risk.lower()}-privilege permissions to all its members — {perm_reason}",
             perm_risk=perm_risk,
         ))
-    findings += _check_resource_wildcards(p, cfg)
-    return findings
+    privilege = [f for f in findings if f.path_id.startswith("GroupPrivilege:")]
+    other = [f for f in findings if not f.path_id.startswith("GroupPrivilege:")]
+    return other + _fold_wildcards_into_privilege(privilege, _check_resource_wildcards(p, cfg))
 
 
 # ─── Persistence ───────────────────────────────────────────────────────────────
@@ -644,6 +718,27 @@ def _persist(db: Session, account: Account, raw: _RawFinding) -> SecurityFinding
         downgrade_note=raw.downgrade_note,
         suppressed=raw.suppressed,
     )
+
+
+def _prune_stale_wildcard_findings(
+    db: Session,
+    principals: list[Principal],
+    emitted: set[tuple[str, str]],
+) -> None:
+    """Drop per-verb ResourceWildcard:* rows that the collapsed rule no longer emits."""
+    arns = [p.arn for p in principals]
+    if not arns:
+        return
+    rows = (
+        db.query(SecurityFinding)
+        .filter(SecurityFinding.entity_arn.in_(arns))
+        .filter(SecurityFinding.path_id.like("ResourceWildcard%"))
+        .all()
+    )
+    for row in rows:
+        if (row.entity_arn, row.path_id) not in emitted:
+            db.delete(row)
+    db.flush()
 
 
 # ─── Public API ────────────────────────────────────────────────────────────────
@@ -726,6 +821,9 @@ def assess(
                 log.warning("[assess] future error: %s", exc)
 
     log.info("[assess] %d raw findings (threshold=%s) — persisting…", len(all_raw), min_severity)
+
+    emitted = {(raw.entity_arn, raw.path_id) for raw in all_raw}
+    _prune_stale_wildcard_findings(db, principals, emitted)
 
     # ── Persist (single-threaded — SQLAlchemy session is not thread-safe) ─────
     results: list[SecurityFinding] = []

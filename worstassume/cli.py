@@ -512,8 +512,16 @@ def assess(account_id: str | None, min_severity: str, severity_config_path: str 
             )
 
         console.print(table)
+        from collections import Counter
+        sev_counts = Counter(f.severity for f in findings)
+        mix = " · ".join(
+            f"{n} {sev.lower()}"
+            for sev in ("CRITICAL", "HIGH", "MEDIUM", "LOW", "INFO")
+            if (n := sev_counts.get(sev))
+        )
         console.print(
-            f"\n[bold]{len(findings)} finding(s)[/bold] persisted to DB — "
+            f"\n[bold]{len(findings)} finding(s)[/bold] persisted to DB"
+            f"{f' — {mix}' if mix else ''} — "
             f"run [bold]worst viz[/bold] to explore via the UI."
         )
     finally:

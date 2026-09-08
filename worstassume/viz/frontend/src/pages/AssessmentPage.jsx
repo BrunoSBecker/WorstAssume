@@ -213,7 +213,14 @@ export default function AssessmentPage() {
   }
 
   const allFindings  = findings || []
-  const critCount    = allFindings.filter(f => f.severity === 'CRITICAL' && !f.suppressed).length
+  const visible = allFindings.filter(f => !f.suppressed)
+  const sevCounts = useMemo(() => {
+    const counts = { CRITICAL: 0, HIGH: 0, MEDIUM: 0, LOW: 0, INFO: 0 }
+    visible.forEach(f => {
+      if (counts[f.severity] !== undefined) counts[f.severity] += 1
+    })
+    return counts
+  }, [visible])
 
   // Dynamic categories from actual data
   const categories = useMemo(() => {
@@ -222,7 +229,7 @@ export default function AssessmentPage() {
   }, [allFindings])
 
   const shown = useMemo(() => {
-    let arr = allFindings.filter(f => !f.suppressed)
+    let arr = visible
     if (catFilter !== 'All') arr = arr.filter(f => f.category === catFilter)
     if (sevFilter !== 'All') arr = arr.filter(f => f.severity === sevFilter)
     if (search.trim()) {
@@ -234,7 +241,7 @@ export default function AssessmentPage() {
       )
     }
     return arr.sort((a, b) => (SEV_ORDER[a.severity] ?? 9) - (SEV_ORDER[b.severity] ?? 9))
-  }, [allFindings, catFilter, sevFilter, search])
+  }, [visible, catFilter, sevFilter, search])
 
   const { page, totalPages, pageItems, goTo } = usePagination(shown, PAGE_SIZE)
 
@@ -254,7 +261,7 @@ export default function AssessmentPage() {
           <div className="page-subtitle">
             {findings === null
               ? 'Loading persisted findings…'
-              : `${allFindings.filter(f => !f.suppressed).length} findings · ${critCount} critical`
+              : `${visible.length} findings · ${sevCounts.CRITICAL} critical · ${sevCounts.HIGH} high · ${sevCounts.MEDIUM} medium · ${sevCounts.LOW} low`
             }
             {lastRun && <span style={{ marginLeft:'8px', color:'var(--text-faint)' }}>Last run: {lastRun}</span>}
           </div>

@@ -207,3 +207,101 @@ def test_cross_ref_user_group_heuristic_removed(db_session, account_a):
     legacy_ids = {f.path_id for f in findings if "UserSharedGroupPolicy" in f.path_id}
     assert not legacy_ids, \
         "Deleted _cross_ref_user_group heuristic must not emit UserSharedGroupPolicy findings"
+
+
+# ── Stream 2: NotAction, inherited wildcards, collapse, golden Criticals ──────
+
+def test_not_action_excluding_iam_is_not_high(db_session, account_a):
+    arn = f"arn:aws:iam::{account_a.account_id}:role/not-iam"
+    role = upsert_principal(db_session, account_a, arn=arn, name="not-iam", principal_type="role")
+    pol = upsert_policy(
+        db_session, account_a,
+        arn=f"{arn}:inline/p", name="everything-but-iam", policy_type="inline",
+        document={"Version": "2012-10-17",
+                  "Statement": [{"Effect": "Allow",
+                                 "NotAction": ["iam:*", "sts:*"],
+                                 "Resource": "*"}]},
+    )
+    link_principal_policy(db_session, role, pol)
+    db_session.commit()
+
+    findings = assess(db_session, account=account_a)
+    role_findings = [f for f in findings if f.entity_arn == role.arn]
+    assert role_findings, "NotAction on Resource:* still grants other write actions"
+    assert all("wildcard Action (*)" not in (f.message or "") for f in role_findings)
+    assert all(f.severity not in {"HIGH", "CRITICAL"} for f in role_findings), \
+        "Allow+NotAction of iam:* and sts:* must not be scored as Action:*"
+
+
+def test_group_inherited_s3_putobject_wildcard_on_user(db_session, account_a):
+    group = _make_group(db_session, account_a, "writers", ["s3:PutObject"])
+    user = _make_user(db_session, account_a, "writer-user")
+    upsert_group_membership(db_session, user=user, group=group, account=account_a)
+    db_session.commit()
+
+    findings = assess(db_session, account=account_a)
+    user_wc = [f for f in findings
+               if f.entity_arn == user.arn and f.category == "RESOURCE_WILDCARD"]
+    assert user_wc, "User must inherit Resource:* write verbs from the group"
+    assert any("s3:putobject" in (f.message or "").lower() for f in user_wc)
+
+
+def test_administrator_access_stays_high(db_session, account_a):
+    arn = f"arn:aws:iam::{account_a.account_id}:role/admin"
+    role = upsert_principal(db_session, account_a, arn=arn, name="admin", principal_type="role")
+    pol = upsert_policy(
+        db_session, account_a,
+        arn=f"arn:aws:iam::aws:policy/AdministratorAccess",
+        name="AdministratorAccess",
+        policy_type="aws_managed",
+        document={"Version": "2012-10-17",
+                  "Statement": [{"Effect": "Allow", "Action": "*", "Resource": "*"}]},
+    )
+    link_principal_policy(db_session, role, pol)
+    db_session.commit()
+
+    findings = assess(db_session, account=account_a)
+    role_findings = [f for f in findings if f.entity_arn == role.arn]
+    perm = [f for f in role_findings if f.category == "PERMISSIVE_POLICY"]
+    wild = [f for f in role_findings if f.category == "RESOURCE_WILDCARD"]
+    assert perm and perm[0].severity == "HIGH"
+    assert not wild, "Wildcard verbs must fold into the HIGH permissive finding"
+    assert "Resource:*" in perm[0].message
+
+
+def test_wildcard_principal_trust_stays_critical(db_session, account_a):
+    trust = {"Version": "2012-10-17",
+             "Statement": [{"Effect": "Allow", "Principal": "*", "Action": "sts:AssumeRole"}]}
+    _make_role(db_session, account_a, "open", ["s3:GetObject"], trust_policy=trust)
+    findings = assess(db_session, account=account_a)
+    trust_f = [f for f in findings if f.path_id == "WildcardTrustNoCondition"]
+    assert trust_f and trust_f[0].severity == "CRITICAL"
+
+
+def test_resource_wildcards_collapse_to_one_finding(db_session, account_a):
+    _make_role(db_session, account_a, "multi", ["s3:PutObject", "s3:DeleteBucket"])
+    findings = assess(db_session, account=account_a)
+    wild = [f for f in findings
+            if "multi" in f.entity_arn and f.category == "RESOURCE_WILDCARD"]
+    assert len(wild) == 1
+    assert wild[0].path_id == "ResourceWildcard"
+    assert "s3:putobject" in wild[0].message.lower()
+    assert "s3:deletebucket" in wild[0].message.lower()
+
+
+def test_stale_per_verb_wildcard_rows_are_pruned(db_session, account_a):
+    from worstassume.db.store import upsert_security_finding
+    role = _make_role(db_session, account_a, "prune-me", ["iam:PassRole"])
+    upsert_security_finding(
+        db_session, account_a,
+        entity_arn=role.arn, entity_type="role", entity_name="prune-me",
+        category="RESOURCE_WILDCARD", path_id="ResourceWildcard:iam:passrole",
+        severity="HIGH", original_severity="HIGH",
+        message="stale per-verb card",
+    )
+    db_session.commit()
+
+    assess(db_session, account=account_a)
+    leftover = [f for f in db_session.query(SecurityFinding).filter_by(entity_arn=role.arn)
+                if f.path_id.startswith("ResourceWildcard:")]
+    assert not leftover

@@ -193,9 +193,12 @@ Runs adaptive IAM + resource enumeration against an AWS account and stores resul
 
 **Flow:**
 1. Resolves caller identity (`sts:GetCallerIdentity`)
-2. Probes capabilities (tries each known-useful API call, notes what's allowed)
-3. Runs all enumeration modules in order: IAM → EC2 → S3 → Lambda → ECS → VPC
-4. Commits everything to DB, saves capability snapshot
+2. Persists the caller as a stable principal seed
+3. Runs a read-only capability waterfall: IAM authorization dump; otherwise one
+   policy-simulation batch; otherwise one minimal probe per unresolved inventory action
+4. Runs enumeration modules in order: IAM → EC2 → S3 → Lambda → ECS → VPC,
+   skipping operations known to be denied
+5. Commits everything to DB, saves the capability snapshot, and prints the AWS call count
 
 ---
 
@@ -236,13 +239,16 @@ Launches the FastAPI backend serving both the REST API and the built React SPA. 
 
 ## Enumeration Modules
 
-### `modules/capability.py`
-Probes the following capabilities by attempting each API call and noting the response:
-- `iam:ListUsers`, `iam:ListRoles`, `iam:ListGroups`
-- `iam:GetPolicy`, `iam:ListAttachedUserPolicies`, etc.
-- `ec2:DescribeInstances`, `s3:ListBuckets`, `lambda:ListFunctions`, `ecs:ListClusters`, `ec2:DescribeVpcs`
+### `core/capability.py`
+Determines read-only inventory capabilities with a waterfall:
+- `iam:GetAccountAuthorizationDetails`; when allowed, other IAM list probes are skipped
+- otherwise `iam:SimulatePrincipalPolicy` evaluates all inventory actions in one batch
+- only if simulation is unavailable, one minimal List/Describe probe is made for each
+  unresolved IAM, EC2, S3, Lambda, ECS, and VPC capability
 
 Returns a `CapabilityMap` object used by each module to skip calls that would fail.
+An assumed-role STS ARN is converted to its IAM role ARN before policy simulation.
+No Create/Put permission probes are performed.
 
 ### `modules/iam.py`
 Enumerates:
@@ -264,14 +270,18 @@ Lists Lambda functions; extracts execution roles (creates `execution_role` links
 Lists ECS clusters, services, task definitions; extracts task execution roles.
 
 ### `modules/vpc.py`
-Lists VPCs, subnets, security groups. Stored as resources for graph context.
+Lists subnets, internet gateways, NAT gateways, and route tables only when the
+corresponding individual Describe capability is allowed. VPCs and security
+groups are handled by the EC2 module.
 
 ---
 
 ## Core Analysis Engine
 
 ### `core/capability.py`
-**CapabilityMap** — a frozen set of boolean flags (`can_list_users`, `can_list_roles`, etc.). Passed to each enumeration module.
+**CapabilityMap** — boolean inventory flags plus internal allowed/denied/skipped
+probe evidence. Passed to each enumeration module; only booleans are persisted
+in the enumeration run.
 
 ### `core/cross_account.py`
 **build_cross_account_links(db)** — iterates over all role trust policies. For any `Principal.AWS` ARN that resolves to a different tracked account, creates or updates a `CrossAccountLink` record.

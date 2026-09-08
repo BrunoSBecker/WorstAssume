@@ -34,7 +34,7 @@ def enumerate(
 
     if cap.iam_full_dump:
         log.info("[iam] using fast path: GetAccountAuthorizationDetails")
-        _fast_path(session, db, account)
+        _fast_path(session, db, account, cap)
     else:
         log.info("[iam] using slow path: individual list/get calls")
         _slow_path(session, db, account, cap)
@@ -42,20 +42,43 @@ def enumerate(
 
 # ─── Fast path ────────────────────────────────────────────────────────────────
 
-def _fast_path(session: SessionManager, db: Session, account: Account) -> None:
+def _fast_path(
+    session: SessionManager,
+    db: Session,
+    account: Account,
+    cap: CapabilityMap,
+) -> None:
     iam = session.client("iam")
-    paginator = iam.get_paginator("get_account_authorization_details")
 
     user_details = []
     group_details = []
     role_details = []
     policy_details = []
 
-    for page in paginator.paginate():
+    def consume(page: dict) -> None:
         user_details.extend(page.get("UserDetailList", []))
         group_details.extend(page.get("GroupDetailList", []))
         role_details.extend(page.get("RoleDetailList", []))
         policy_details.extend(page.get("Policies", []))
+
+    # Reuse the permission probe's first page. If callers construct a
+    # CapabilityMap manually (tests/library use), retain the normal paginator.
+    first_page = cap._iam_dump_first_page
+    if first_page is None:
+        paginator = iam.get_paginator("get_account_authorization_details")
+        for page in paginator.paginate():
+            consume(page)
+    else:
+        page = first_page
+        while True:
+            consume(page)
+            if not page.get("IsTruncated"):
+                break
+            marker = page.get("Marker")
+            if not marker:
+                log.warning("[iam] authorization dump was truncated without a Marker")
+                break
+            page = iam.get_account_authorization_details(Marker=marker)
 
     log.info(
         "[iam] found %d users, %d groups, %d roles, %d policies",
@@ -211,8 +234,9 @@ def _slow_path(
     iam = session.client("iam")
 
     # Groups must be enumerated BEFORE users so group rows exist when linking memberships
-    if cap.iam_list_users:
+    if cap.iam_list_groups:
         _enumerate_groups_for_slow_path(iam, db, account)
+    if cap.iam_list_users:
         _enumerate_users(iam, db, account)
     if cap.iam_list_roles:
         _enumerate_roles(iam, db, account)

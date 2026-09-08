@@ -21,17 +21,21 @@ def enumerate(
     account: Account,
     cap: CapabilityMap,
 ) -> None:
-    if not cap.ec2_vpcs:
+    if not cap.has_any_vpc:
         log.info("[vpc] no VPC permissions detected — skipping")
         return
 
     ec2 = session.client("ec2")
     region = session.region
 
-    _enumerate_subnets(ec2, db, account, region)
-    _enumerate_internet_gateways(ec2, db, account, region)
-    _enumerate_nat_gateways(ec2, db, account, region)
-    _enumerate_route_tables(ec2, db, account, region)
+    if cap.ec2_subnets:
+        _enumerate_subnets(ec2, db, account, region)
+    if cap.ec2_internet_gateways:
+        _enumerate_internet_gateways(ec2, db, account, region)
+    if cap.ec2_nat_gateways:
+        _enumerate_nat_gateways(ec2, db, account, region)
+    if cap.ec2_route_tables:
+        _enumerate_route_tables(ec2, db, account, region)
 
 
 def _enumerate_subnets(ec2, db: Session, account: Account, region: str) -> None:

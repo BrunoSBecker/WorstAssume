@@ -17,6 +17,7 @@ from moto import mock_aws
 
 from worstassume.core.capability import (
     CapabilityMap,
+    normalize_policy_source_arn,
     probe_capabilities,
 )
 from worstassume.session import SessionManager
@@ -60,6 +61,15 @@ class TestCapabilityMap:
     def test_default_all_false(self):
         cap = CapabilityMap()
         assert all(not v for v in cap.to_dict().values())
+
+    def test_assumed_role_arn_is_normalized_for_simulation(self):
+        assert normalize_policy_source_arn(
+            "arn:aws:sts::123456789012:assumed-role/DemoRole/session-1"
+        ) == "arn:aws:iam::123456789012:role/DemoRole"
+
+    def test_user_arn_is_not_changed(self):
+        arn = "arn:aws:iam::123456789012:user/alice"
+        assert normalize_policy_source_arn(arn) == arn
 
 
 
@@ -125,3 +135,82 @@ class TestProbeCapabilities:
 
         assert cap.ec2_instances is True
         assert cap.s3_buckets is False
+
+
+class TestWaterfallBehavior:
+    def test_full_dump_skips_other_iam_probes(self):
+        session = MagicMock(spec=SessionManager)
+        iam = MagicMock()
+        iam.get_account_authorization_details.return_value = {
+            "UserDetailList": [],
+            "GroupDetailList": [],
+            "RoleDetailList": [],
+            "Policies": [],
+            "IsTruncated": False,
+        }
+        service_clients: dict[str, MagicMock] = {"iam": iam}
+
+        def client(service):
+            return service_clients.setdefault(service, MagicMock())
+
+        session.client.side_effect = client
+        cap = probe_capabilities(
+            session, "arn:aws:iam::123456789012:user/test"
+        )
+
+        assert cap.iam_full_dump is True
+        iam.list_roles.assert_not_called()
+        iam.list_users.assert_not_called()
+        iam.list_groups.assert_not_called()
+        iam.list_policies.assert_not_called()
+        iam.simulate_principal_policy.assert_not_called()
+
+    def test_simulated_ec2_deny_avoids_ec2_inventory_request(self):
+        session = MagicMock(spec=SessionManager)
+        iam = MagicMock()
+        ec2 = MagicMock()
+        iam.get_account_authorization_details.side_effect = _access_denied_error(
+            "GetAccountAuthorizationDetails"
+        )
+
+        def simulate(**kwargs):
+            return {
+                "EvaluationResults": [
+                    {
+                        "EvalActionName": action,
+                        "EvalDecision": "implicitDeny",
+                    }
+                    for action in kwargs["ActionNames"]
+                ]
+            }
+
+        iam.simulate_principal_policy.side_effect = simulate
+        session.client.side_effect = lambda service: iam if service == "iam" else ec2
+
+        cap = probe_capabilities(
+            session, "arn:aws:iam::123456789012:user/test"
+        )
+
+        assert cap.iam_simulate is True
+        assert cap.ec2_instances is False
+        ec2.describe_instances.assert_not_called()
+        ec2.describe_security_groups.assert_not_called()
+        ec2.describe_vpcs.assert_not_called()
+
+    def test_simulation_receives_canonical_assumed_role_arn(self):
+        session = MagicMock(spec=SessionManager)
+        iam = MagicMock()
+        iam.get_account_authorization_details.side_effect = _access_denied_error(
+            "GetAccountAuthorizationDetails"
+        )
+        iam.simulate_principal_policy.return_value = {"EvaluationResults": []}
+        session.client.return_value = iam
+
+        probe_capabilities(
+            session,
+            "arn:aws:sts::123456789012:assumed-role/DemoRole/session-1",
+        )
+
+        assert iam.simulate_principal_policy.call_args.kwargs["PolicySourceArn"] == (
+            "arn:aws:iam::123456789012:role/DemoRole"
+        )

@@ -283,8 +283,8 @@ def graph_export(output: str):
 
 # ─── privesc ──────────────────────────────────────────────────────────────────
 
-_SEV_ORDER = {"CRITICAL": 0, "HIGH": 1, "MEDIUM": 2}
-_SEV_COLOR = {"CRITICAL": "red", "HIGH": "yellow", "MEDIUM": "cyan"}
+_SEV_ORDER = {"CRITICAL": 0, "HIGH": 1, "MEDIUM": 2, "LOW": 3, "INFO": 4}
+_SEV_COLOR = {"CRITICAL": "red", "HIGH": "yellow", "MEDIUM": "cyan", "LOW": "blue", "INFO": "dim"}
 
 
 def _path_to_dict(p) -> dict:
@@ -343,8 +343,8 @@ def _print_paths_table(paths) -> None:
 @click.option("--account-id", default=None,
               help="Restrict graph to a single AWS account ID.")
 @click.option(
-    "--min-severity", default="HIGH", show_default=True,
-    type=click.Choice(["CRITICAL", "HIGH", "MEDIUM"], case_sensitive=False),
+    "--min-severity", default="INFO", show_default=True,
+    type=click.Choice(["CRITICAL", "HIGH", "MEDIUM", "LOW", "INFO"], case_sensitive=False),
     help="Minimum severity to display.",
 )
 @click.option(
@@ -453,7 +453,7 @@ def privesc(
 @click.option("--account-id", default=None, help="Limit analysis to a single account.")
 @click.option(
     "--min-severity",
-    default="HIGH",
+    default="INFO",
     show_default=True,
     type=click.Choice(["CRITICAL", "HIGH", "MEDIUM", "LOW", "INFO"], case_sensitive=False),
     help="Minimum severity to persist and display.",

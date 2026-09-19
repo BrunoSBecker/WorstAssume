@@ -851,7 +851,7 @@ async def api_security_findings_run(
 
     body = body or {}
     account_id   = body.get("account_id")
-    min_severity = body.get("min_severity", "HIGH").upper()
+    min_severity = body.get("min_severity", "INFO").upper()
 
     db = get_session()
     try:

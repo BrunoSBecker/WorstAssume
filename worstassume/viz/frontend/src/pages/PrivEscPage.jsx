@@ -7,17 +7,11 @@ import Paginator, { usePagination } from '../components/Paginator'
 
 const SEV_ORDER = { CRITICAL: 0, HIGH: 1, MEDIUM: 2, LOW: 3 }
 
-const PRESET_OBJECTIVES = [
-  { label: 'Admin / AdministratorAccess', value: 'permission:*:*' },
-  { label: 'Any principal (full scan)',   value: 'principal:*' },
-  { label: 'iam:PassRole capability',     value: 'permission:iam:PassRole' },
-  { label: 'iam:AttachUserPolicy',        value: 'permission:iam:AttachUserPolicy' },
-  { label: 'iam:CreateAccessKey',         value: 'permission:iam:CreateAccessKey' },
-]
-
 // ─── Principal search dropdown ─────────────────────────────────────────────────
 
-function PrincipalSearch({ label, value, onChange }) {
+function PrincipalSearch({ label, value, onChange,
+                          fetcher = (q) => api.principals(q),
+                          mapSelection = (p) => p.arn || p.node_id }) {
   const [query,   setQuery]   = useState('')
   const [results, setResults] = useState([])
   const [open,    setOpen]    = useState(false)
@@ -30,8 +24,9 @@ function PrincipalSearch({ label, value, onChange }) {
     debounce.current = setTimeout(async () => {
       setLoading(true)
       try {
-        const data = await api.principals(query)
-        setResults((Array.isArray(data) ? data : (data?.principals || [])).slice(0, 20))
+        const data = await fetcher(query)
+        const list = Array.isArray(data) ? data : (data?.items || data?.principals || [])
+        setResults(list.slice(0, 20))
         setOpen(true)
       } catch { setResults([]) }
       finally { setLoading(false) }
@@ -39,8 +34,8 @@ function PrincipalSearch({ label, value, onChange }) {
   }, [query])
 
   function select(p) {
-    onChange(p.arn || p.node_id)
-    setQuery(p.label || (p.arn || '').split('/').pop())
+    onChange(mapSelection(p))
+    setQuery(p.label || (p.arn || p.node_id || '').split('/').pop())
     setOpen(false)
   }
 
@@ -88,16 +83,15 @@ function PrincipalSearch({ label, value, onChange }) {
 
 function AnalyzeModal({ onRun, onClose, initialObjective = null }) {
   const [fromArn,   setFromArn]   = useState('')
-  const [objective, setObjective] = useState(initialObjective ? '__custom__' : '')
-  const [customObj, setCustomObj] = useState(initialObjective || '')
+  const [targetObjective, setTargetObjective] = useState(initialObjective || '')
   const [maxHops,   setMaxHops]   = useState(10)
   const [running,   setRunning]   = useState(false)
   const [err,       setErr]       = useState(null)
 
-  const effectiveObj = objective === '__custom__' ? customObj : objective
+  const effectiveObj = targetObjective || null
 
   async function submit() {
-    if (!fromArn.trim()) return
+    if (!fromArn.trim() || !targetObjective.trim()) return
     setRunning(true); setErr(null)
     try {
       await onRun(fromArn, effectiveObj || null, maxHops)
@@ -119,19 +113,14 @@ function AnalyzeModal({ onRun, onClose, initialObjective = null }) {
         </div>
         <div className="modal-body" style={{ display:'flex', flexDirection:'column', gap:'14px' }}>
           <PrincipalSearch label="From (attacker identity)" value={fromArn} onChange={setFromArn} />
-          <div>
-            <div style={{ fontSize:'9px', color:'var(--text-dim)', marginBottom:'4px', textTransform:'uppercase', letterSpacing:'.06em' }}>Target / Objective</div>
-            <select className="form-select" value={objective} onChange={e => setObjective(e.target.value)}>
-              <option value="">— Any (full scan) —</option>
-              {PRESET_OBJECTIVES.map(o => <option key={o.value} value={o.value}>{o.label}</option>)}
-              <option value="__custom__">Custom objective…</option>
-            </select>
-            {objective === '__custom__' && (
-              <input className="filter-search" style={{ width:'100%', marginTop:'6px', fontFamily:'IBM Plex Mono' }}
-                placeholder="principal:arn:aws:…  or  permission:iam:*"
-                value={customObj} onChange={e => setCustomObj(e.target.value)} />
-            )}
-          </div>
+          <PrincipalSearch label="To (target — user, role, group or resource)"
+            value={targetObjective}
+            onChange={setTargetObjective}
+            fetcher={async q => {
+              const d = await api.entities({ q, page_size: 30 })
+              return (d?.items || []).filter(i => i.node_type === 'principal' || i.node_type === 'resource')
+            }}
+            mapSelection={p => (p.node_type === 'resource' ? 'resource:' : 'principal:') + (p.arn || p.node_id)} />
           <div style={{ display:'flex', alignItems:'center', gap:'12px' }}>
             <div style={{ fontSize:'9px', color:'var(--text-dim)', textTransform:'uppercase', letterSpacing:'.06em' }}>Max hops</div>
             <select className="form-select" style={{ width:80 }} value={maxHops} onChange={e => setMaxHops(Number(e.target.value))}>
@@ -142,7 +131,7 @@ function AnalyzeModal({ onRun, onClose, initialObjective = null }) {
         </div>
         <div className="modal-footer">
           <button className="btn secondary sm" onClick={onClose}>Cancel</button>
-          <button className="btn primary sm" disabled={running || !fromArn.trim()} onClick={submit}>
+          <button className="btn primary sm" disabled={running || !fromArn.trim() || !targetObjective.trim()} onClick={submit}>
             {running ? <><span className="spinner-ring" style={{ width:12, height:12, borderWidth:2 }} /> Analyzing…</> : '▶ Run'}
           </button>
         </div>

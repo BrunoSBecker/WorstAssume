@@ -442,6 +442,8 @@ def _inline_risk(policies) -> tuple[str, str]:
     Allow+NotAction is expanded via tracked actions; it is never treated as Action:*.
     """
     risk, reason = "LOW", "read-only or tightly scoped policies"
+    write_kw = ("put", "create", "delete", "update", "invoke",
+                "passrole", "full", "write", "start", "stop")
     for pol in policies:
         doc = pol.document
         if not doc:
@@ -451,6 +453,7 @@ def _inline_risk(policies) -> tuple[str, str]:
                 continue
             actions   = _allow_stmt_actions(stmt)
             resources = [r.lower() for r in _normalize_list(stmt.get("Resource")) if isinstance(r, str)]
+            has_write = any(any(kw in a for kw in write_kw) for a in actions)
             if "*" in actions:
                 return "HIGH", "wildcard Action (*) in inline policy"
             if "*" in resources:
@@ -458,11 +461,30 @@ def _inline_risk(policies) -> tuple[str, str]:
                     return "HIGH", "iam:* or sts:AssumeRole on Resource: *"
                 if any(_can_do_ci(actions, v) for v in _HIGH_SEVERITY_VERBS):
                     return "HIGH", "IAM privilege-escalation actions on Resource: *"
-                write_kw = ("put", "create", "delete", "update", "invoke",
-                            "passrole", "full", "write", "start", "stop")
-                if any(any(kw in a for kw in write_kw) for a in actions):
+                if has_write:
                     risk, reason = "MEDIUM", "write actions on wildcard resources (inline)"
+            elif has_write and risk == "LOW":
+                # Write/mutate actions but scoped to specific resources: notable
+                # but low risk (distinct from pure read-only, which is silent).
+                reason = "write actions on scoped resources (inline)"
     return risk, reason
+
+
+_LOW_NOISE_REASONS = frozenset({
+    "read-only or tightly scoped policies", "no policies attached",
+})
+
+
+def _reportable_perm_risk(perm_risk: str, perm_reason: str) -> bool:
+    """Whether a permission risk is worth a finding.
+
+    HIGH/MEDIUM always are. LOW is only reported when it reflects a real (if
+    scoped) grant — pure read-only and empty principals stay silent so the LOW
+    tier is meaningful rather than noise.
+    """
+    if perm_risk in ("HIGH", "MEDIUM"):
+        return True
+    return perm_risk == "LOW" and perm_reason not in _LOW_NOISE_REASONS
 
 
 def _assess_permissions(p: Principal) -> tuple[str, str]:
@@ -501,7 +523,7 @@ def _permissive_findings(
     """
     perm_risk, perm_reason = _assess_permissions(p)
     findings: list[_RawFinding] = []
-    if perm_risk in ("HIGH", "MEDIUM"):
+    if _reportable_perm_risk(perm_risk, perm_reason):
         pid = f"PermissivePolicy:{perm_risk}"
         sev = cfg.resolve(pid, perm_risk)
         findings.append(_RawFinding(
@@ -614,7 +636,7 @@ def _assess_user(p: Principal, cfg: SeverityConfig) -> list[_RawFinding]:
     perm_risk, perm_reason = _assess_permissions(p)
 
     # Privilege findings
-    if perm_risk in ("HIGH", "MEDIUM"):
+    if _reportable_perm_risk(perm_risk, perm_reason):
         pid = f"UserPrivilege:{perm_risk}"
         sev = cfg.resolve(pid, perm_risk)
         findings.append(_RawFinding(
@@ -682,7 +704,7 @@ def _assess_user(p: Principal, cfg: SeverityConfig) -> list[_RawFinding]:
 def _assess_group(p: Principal, cfg: SeverityConfig) -> list[_RawFinding]:
     findings: list[_RawFinding] = []
     perm_risk, perm_reason = _assess_permissions(p)
-    if perm_risk in ("HIGH", "MEDIUM"):
+    if _reportable_perm_risk(perm_risk, perm_reason):
         pid = f"GroupPrivilege:{perm_risk}"
         sev = cfg.resolve(pid, perm_risk)
         findings.append(_RawFinding(

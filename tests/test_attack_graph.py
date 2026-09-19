@@ -501,18 +501,21 @@ class TestImdsEdge:
 # 12. test_lambda_code_overwrite_edge
 # ─────────────────────────────────────────────────────────────────────────────
 class TestLambdaCodeOverwriteEdge:
-    def test_update_function_code_targets_lambda_exec_role(self, db_session, account_a):
+    def test_update_function_code_reaches_role_and_function(self, db_session, account_a):
         exec_role = _make_role(db_session, account_a, "LambdaRole", [])
         fn = _make_lambda_resource(db_session, account_a, "fn", role=exec_role)
         attacker = _make_role(db_session, account_a, "attacker", ["lambda:UpdateFunctionCode"])
         G = _graph(db_session, account_a)
 
-        # Edge points to exec role, not to the function
+        # Collapsed convenience edge straight to the exec role is still present.
         edges = _edges_between(G, attacker.arn, exec_role.arn)
         assert any(e["edge_type"] == "lambda_code_overwrite" for e in edges)
-        # No overwrite edge to the function node itself
+        # The function itself is now a reachable hop (so it can be targeted) ...
         edges_to_fn = _edges_between(G, attacker.arn, fn.arn)
-        assert not any(e["edge_type"] == "lambda_code_overwrite" for e in edges_to_fn)
+        assert any(e["edge_type"] == "lambda_code_overwrite" for e in edges_to_fn)
+        # ... and it runs_as its execution role, so a path can pivot through it.
+        runs_as = _edges_between(G, fn.arn, exec_role.arn)
+        assert any(e["edge_type"] == "runs_as" for e in runs_as)
 
     def test_lambda_code_overwrite_severity_high(self, db_session, account_a):
         exec_role = _make_role(db_session, account_a, "LambdaRole", [])

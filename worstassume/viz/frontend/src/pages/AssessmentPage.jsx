@@ -3,7 +3,7 @@ import { useApp } from '../context/AppContext'
 import { api } from '../api'
 import Paginator, { usePagination } from '../components/Paginator'
 
-const SEV_ORDER = { CRITICAL: 0, HIGH: 1, MEDIUM: 2, LOW: 3 }
+const SEV_ORDER = { CRITICAL: 0, HIGH: 1, MEDIUM: 2, LOW: 3, INFO: 4 }
 
 function sevClass(sev) { return (sev || '').toLowerCase() }
 
@@ -68,8 +68,8 @@ function RunModal({ accounts, onRun, onClose }) {
           <div className="form-group">
             <label className="form-label">Min severity</label>
             <select className="form-select" value={minSev} onChange={e => setMinSev(e.target.value)}>
-              <option value="">— Any severity —</option>
-              {['CRITICAL','HIGH','MEDIUM','LOW'].map(s => (
+              <option value="">— All severities —</option>
+              {['CRITICAL','HIGH','MEDIUM','LOW','INFO'].map(s => (
                 <option key={s} value={s}>{s}</option>
               ))}
             </select>
@@ -261,7 +261,7 @@ export default function AssessmentPage() {
           <div className="page-subtitle">
             {findings === null
               ? 'Loading persisted findings…'
-              : `${visible.length} findings · ${sevCounts.CRITICAL} critical · ${sevCounts.HIGH} high · ${sevCounts.MEDIUM} medium · ${sevCounts.LOW} low`
+              : `${visible.length} findings · ${sevCounts.CRITICAL} critical · ${sevCounts.HIGH} high · ${sevCounts.MEDIUM} medium · ${sevCounts.LOW} low · ${sevCounts.INFO} info`
             }
             {lastRun && <span style={{ marginLeft:'8px', color:'var(--text-faint)' }}>Last run: {lastRun}</span>}
           </div>
@@ -293,7 +293,7 @@ export default function AssessmentPage() {
           ))}
         </div>
         <div style={{ display:'flex', gap:'4px', marginLeft:'auto' }}>
-          {['All','CRITICAL','HIGH','MEDIUM','LOW'].map(s => (
+          {['All','CRITICAL','HIGH','MEDIUM','LOW','INFO'].map(s => (
             <button key={s} className={`filter-chip ${sevFilter === s ? 'active' : ''}`}
               onClick={() => setSevFilter(s)}>{s}</button>
           ))}

@@ -8,6 +8,7 @@ Consumed by attack_path.py for traversal and path ranking.
 from __future__ import annotations
 import logging
 from collections.abc import Iterator
+from dataclasses import dataclass
 from typing import Any
 import networkx as nx
 from sqlalchemy.orm import Session, joinedload
@@ -18,6 +19,7 @@ from worstassume.core.iam_actions import (
     _can_do,
     _resource_matches,
 )
+from worstassume.core.cross_account_gate import GateEdge, _CrossAccountGate
 
 log = logging.getLogger(__name__)
 
@@ -64,6 +66,9 @@ _EXPLANATIONS: dict[str, str] = {
     "PATH-032": "Attacker can run SSM Run Command on an EC2 instance to execute code and steal the instance profile credentials.",
     "PATH-033": "Attacker can push an SSH public key to any EC2 instance via EC2 Instance Connect to gain shell access.",
     "PATH-035": "Attacker can replace an S3 bucket policy to grant themselves or an external principal access to the bucket contents.",
+    "PATH-038": "Attacker can read objects from this S3 bucket (s3:GetObject) to exfiltrate its contents.",
+    "PATH-039": "Attacker can list this S3 bucket (s3:ListBucket) to enumerate its objects.",
+    "PATH-040": "This resource runs as the target execution role — compromising the resource yields that role's credentials.",
     "PATH-036": "Attacker can harvest plaintext credentials or secrets from Secrets Manager or SSM Parameter Store.",
     "PATH-037": "Attacker can access the ECS task metadata endpoint from within a task to steal the task's IAM role credentials.",
     "PATH-042": "Attacker can disable CloudTrail logging or delete GuardDuty detectors to blind defensive monitoring.",
@@ -96,6 +101,14 @@ def build_attack_graph(
             if src not in G or neighbor_arn not in G:
                 continue
             G.add_edge(src, neighbor_arn, **edge_data)
+            edge_count += 1
+
+    # Resource -> execution-role runs_as edges (compute pivots)
+    for r in ctx.resources:
+        for neighbor_arn, edge_data in ctx.get_neighbors(r.arn):
+            if r.arn not in G or neighbor_arn not in G:
+                continue
+            G.add_edge(r.arn, neighbor_arn, **edge_data)
             edge_count += 1
 
     log.info("[attack_graph] built: %d nodes, %d edges",
@@ -202,8 +215,20 @@ class NeighborContext:
         # execution_role.arn, so e.g. thousands of Lambdas become far fewer
         # unique roles. Also avoids re-reading Resource.extra (a json.loads
         # property) on every expansion.
-        self._abuse_targets_by_rule: dict[str, list[str]] = \
-            _build_abuse_targets(self.resources)
+        # Accounts we actually enumerated — lets the cross-account gate tell
+        # "target has no resource policy" (real evidence) apart from "target not
+        # in our catalogue".
+        self.known_accounts: set[str] = {
+            p.account.account_id for p in self.principals if p.account
+        } | {
+            r.account.account_id for r in self.resources if r.account
+        }
+
+        self._abuse_targets_by_rule: dict[str, list[_AbuseTarget]] = \
+            _build_abuse_targets(self.resources, self.known_accounts)
+
+        # Lazily-built cross-account gates for lateral targets (secrets/SSM/EC2).
+        self._resource_gate_cache: dict[str, _CrossAccountGate] = {}
 
     # ── Public interface ─────────────────────────────────────────────────
 
@@ -216,15 +241,26 @@ class NeighborContext:
         explanation.  Callers add 'actor' / 'target' as needed.
         """
         attacker = self._principal_by_arn.get(arn)
-        if attacker is None or attacker.principal_type not in ("user", "role"):
-            log.debug("[neighbors] skip %s — not a user/role", arn)
+        if attacker is not None and attacker.principal_type in ("user", "role"):
+            log.debug("[neighbors] expanding %s", arn)
+            yield from self._iam_neighbors(attacker)
+            yield from self._passrole_neighbors(attacker)
+            yield from self._resource_abuse_neighbors(attacker)
+            yield from self._compute_resource_neighbors(attacker)
+            yield from self._lateral_neighbors(attacker)
+            yield from self._group_membership_neighbors(attacker)
             return
-        log.debug("[neighbors] expanding %s", arn)
-        yield from self._iam_neighbors(attacker)
-        yield from self._passrole_neighbors(attacker)
-        yield from self._resource_abuse_neighbors(attacker)
-        yield from self._lateral_neighbors(attacker)
-        yield from self._group_membership_neighbors(attacker)
+        # Resource node: expand to the execution role it runs as, so a path that
+        # compromises the resource (e.g. UpdateFunctionCode on a Lambda) pivots
+        # to that role's credentials. Privesc traversal only; the threat-model
+        # view (get_access_neighbors) already models this via its runs_as family.
+        res = self._resource_by_arn.get(arn)
+        if res is not None and res.execution_role:
+            yield res.execution_role.arn, dict(
+                edge_type="runs_as", path_id="PATH-040",
+                action="sts:AssumeRole (service role)", severity=SEVERITY_HIGH,
+                explanation=_EXPLANATIONS.get("PATH-040", "runs_as"),
+            )
 
     def get_access_neighbors(
         self, arn: str
@@ -245,7 +281,7 @@ class NeighborContext:
         if attacker is None or attacker.principal_type not in ("user", "role"):
             return
         yield from self._passrole_neighbors(attacker)
-        yield from self._resource_abuse_neighbors(attacker)
+        yield from self._resource_abuse_neighbors(attacker, access_only=True)
         yield from self._lateral_neighbors(attacker)
 
     # ── Neighbor generators (one per edge family) ──────────────────────
@@ -302,16 +338,74 @@ class NeighborContext:
                 )
 
     def _resource_abuse_neighbors(
-        self, attacker: Principal
+        self, attacker: Principal, access_only: bool = False
     ) -> Iterator[tuple[str, dict]]:
         actions = self.action_cache.get(attacker.arn, frozenset())
+        attacker_acct = attacker.account.account_id if attacker.account else ""
         for svc, rtype, action, edge_type, path_id, severity in _RESOURCE_ABUSE_TABLE:
+            if access_only and edge_type in _READ_ONLY_REACH_EDGES:
+                continue
             if not _abuse_rule_allowed(edge_type, action, actions):
                 continue
             expl = _EXPLANATIONS.get(path_id, edge_type)
             edge_action = _abuse_edge_action(edge_type, action)
-            for target in self._abuse_targets_by_rule.get(edge_type, ()):
-                yield target, dict(
+            gedge = GateEdge(family="abuse", edge_type=edge_type, action=edge_action)
+            for t in self._abuse_targets_by_rule.get(edge_type, ()):
+                # Cross-account resource abuse only counts when the abused
+                # resource's own policy admits the attacker; same-account is
+                # exempt (identity policy suffices) inside the gate.
+                if not t.gate.allows(attacker.arn, attacker_acct, gedge):
+                    continue
+                yield t.target_arn, dict(
+                    edge_type=edge_type, path_id=path_id,
+                    action=edge_action, severity=severity, explanation=expl,
+                )
+
+    def _gate_for_resource(self, r: Resource) -> _CrossAccountGate:
+        """Cross-account gate for a lateral target resource (secret/SSM/EC2).
+
+        Cached per resource ARN. EC2/SSM with no resource policy yield an empty
+        gate, so cross-account lateral movement to them is correctly dropped;
+        secrets with a resource policy are gated on that policy. Same-account is
+        exempt inside the gate.
+        """
+        g = self._resource_gate_cache.get(r.arn)
+        if g is None:
+            from worstassume.core.threat_model import resource_policy_accessors
+            acct = r.account.account_id if r.account else None
+            respol, _flags = resource_policy_accessors(
+                r, "resource", self.known_accounts, acct)
+            g = _CrossAccountGate(acct, respol, have_evidence=True)
+            self._resource_gate_cache[r.arn] = g
+        return g
+
+    def _compute_resource_neighbors(
+        self, attacker: Principal
+    ) -> Iterator[tuple[str, dict]]:
+        """Privesc-only: reach the compute *resource* itself, not just its
+        collapsed execution role, so a scan can target the resource and route a
+        path through it (resource -> runs_as -> execution role). Only resources
+        that hand out an execution role become pivots; S3 reads already point at
+        the bucket directly and are skipped here.
+        """
+        actions = self.action_cache.get(attacker.arn, frozenset())
+        attacker_acct = attacker.account.account_id if attacker.account else ""
+        for svc, rtype, action, edge_type, path_id, severity in _RESOURCE_ABUSE_TABLE:
+            if edge_type in _READ_ONLY_REACH_EDGES:
+                continue
+            if not _abuse_rule_allowed(edge_type, action, actions):
+                continue
+            expl = _EXPLANATIONS.get(path_id, edge_type)
+            edge_action = _abuse_edge_action(edge_type, action)
+            gedge = GateEdge(family="abuse", edge_type=edge_type, action=edge_action)
+            for r in self.resources:
+                if not r.execution_role:
+                    continue
+                if not _abuse_rule_matches_resource(edge_type, svc, rtype, r):
+                    continue
+                if not self._gate_for_resource(r).allows(attacker.arn, attacker_acct, gedge):
+                    continue
+                yield r.arn, dict(
                     edge_type=edge_type, path_id=path_id,
                     action=edge_action, severity=severity, explanation=expl,
                 )
@@ -344,8 +438,11 @@ class NeighborContext:
 
         # ssm:SendCommand
         if _can_do(actions, "ssm:SendCommand"):
+            gedge = GateEdge("abuse", "ssm_lateral", "ssm:SendCommand")
             for r in self.resources:
                 if r.service == "ec2" and r.execution_role:
+                    if not self._gate_for_resource(r).allows(attacker.arn, acct_id, gedge):
+                        continue
                     yield r.execution_role.arn, dict(
                         edge_type="ssm_lateral", path_id="PATH-032",
                         action="ssm:SendCommand", severity=SEVERITY_HIGH,
@@ -355,8 +452,11 @@ class NeighborContext:
         # Secret harvest
         if _can_do(actions, "secretsmanager:GetSecretValue") or \
            _can_do(actions, "ssm:GetParameter"):
+            gedge = GateEdge("abuse", "secret_harvest", "secretsmanager:GetSecretValue")
             for r in self.resources:
                 if r.service in ("secretsmanager", "ssm"):
+                    if not self._gate_for_resource(r).allows(attacker.arn, acct_id, gedge):
+                        continue
                     yield r.arn, dict(
                         edge_type="secret_harvest", path_id="PATH-036",
                         action="secretsmanager:GetSecretValue",
@@ -555,6 +655,13 @@ _PASSROLE_SERVICE_TRUST: dict[str, str] = {
 
 # ── Resource abuse edges ──────────────────────────────────────────────────
 
+# Edge types that model plain (allowed) resource READ, not a privilege change.
+# They let a forward privesc path terminate on a resource the actor can read
+# (e.g. an S3 bucket). The access / threat-model view already covers reads via
+# the identity_policy family, so these are excluded there to avoid a redundant,
+# mislabeled "abuse" edge.
+_READ_ONLY_REACH_EDGES = frozenset({"s3_object_read", "s3_bucket_read"})
+
 _RESOURCE_ABUSE_TABLE = [
     # (service, resource_type, action, edge_type, path_id, severity)
     ("lambda",    "function",  "lambda:UpdateFunctionCode",                    "lambda_code_overwrite",     "PATH-019", SEVERITY_HIGH),
@@ -565,6 +672,8 @@ _RESOURCE_ABUSE_TABLE = [
     ("ecs",       "task-definition", None,                                      "ecs_metadata_steal",        "PATH-037", SEVERITY_MEDIUM),
     ("ec2",       "instance",  "ec2-instance-connect:SendSSHPublicKey",        "ec2_instance_connect",      "PATH-033", SEVERITY_MEDIUM),
     ("s3",        "bucket",    "s3:PutBucketPolicy",                           "s3_bucket_policy_abuse",    "PATH-035", SEVERITY_HIGH),
+    ("s3",        "bucket",    "s3:GetObject",                                 "s3_object_read",            "PATH-038", SEVERITY_HIGH),
+    ("s3",        "bucket",    "s3:ListBucket",                                "s3_bucket_read",            "PATH-039", SEVERITY_MEDIUM),
 ]
 
 # Actions that let an attacker execute code *on* an instance / task. Without one
@@ -636,21 +745,43 @@ def _abuse_rule_matches_resource(
     return True
 
 
-def _build_abuse_targets(resources: list) -> dict[str, list[str]]:
-    """Precompute the deduped target ARN set for each resource-abuse rule.
+@dataclass(frozen=True)
+class _AbuseTarget:
+    """A resource-abuse edge target plus the gate guarding it cross-account."""
+    target_arn: str
+    resource_account: str | None
+    gate: _CrossAccountGate
 
-    Targets collapse onto execution_role.arn where one exists, so many
-    resources share a target. Built once per NeighborContext instead of
-    re-scanning every resource on each expansion.
+
+def _build_abuse_targets(
+    resources: list, known_accounts: set[str]
+) -> dict[str, list[_AbuseTarget]]:
+    """Precompute deduped abuse targets per rule, each with a cross-account gate.
+
+    Targets collapse onto execution_role.arn where one exists, so many resources
+    share a target. Each target carries a _CrossAccountGate built from the abused
+    resource's own resource policy, so a cross-account edge only survives when
+    that policy admits the attacker (same-account targets are exempt inside the
+    gate). Built once per NeighborContext.
     """
-    out: dict[str, list[str]] = {}
+    from worstassume.core.threat_model import resource_policy_accessors  # lazy: cycle
+
+    out: dict[str, list[_AbuseTarget]] = {}
     for svc, rtype, _action, edge_type, _pid, _sev in _RESOURCE_ABUSE_TABLE:
-        targets: set[str] = set()
+        merged: dict[tuple[str, str | None], list] = {}
         for r in resources:
             if not _abuse_rule_matches_resource(edge_type, svc, rtype, r):
                 continue
-            targets.add(r.execution_role.arn if r.execution_role else r.arn)
-        out[edge_type] = sorted(targets)
+            target_arn = r.execution_role.arn if r.execution_role else r.arn
+            racct = r.account.account_id if r.account else None
+            respol, _flags = resource_policy_accessors(
+                r, "resource", known_accounts, racct)
+            merged.setdefault((target_arn, racct), []).extend(respol)
+        out[edge_type] = [
+            _AbuseTarget(target_arn=tarn, resource_account=racct,
+                         gate=_CrossAccountGate(racct, respol, have_evidence=True))
+            for (tarn, racct), respol in sorted(merged.items(), key=lambda kv: kv[0][0])
+        ]
     return out
 
 

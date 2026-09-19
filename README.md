@@ -239,3 +239,36 @@ Override: `worst --db /path/to/custom.sqlite <command>`
 - All AWS API calls are **read-only**. No resources are created or modified.
 - In stealth mode (`--stealth`) calls are serialised with random jitter to reduce noise patterns in CloudTrail.
 - The web dashboard binds to `127.0.0.1` by default. Use `--host 0.0.0.0` to expose on the network (e.g. inside Docker).
+
+## Known Limitations
+
+The analysis engine is deliberately conservative ("worst assume"), and a few
+refinements are intentionally out of scope for now. Knowing them keeps findings
+honest:
+
+- **Trust-policy conditions are not evaluated for assume-role edges.** A role
+  whose trust requires `sts:ExternalId`, MFA, or a source-IP is still treated as
+  assumable by the trusted principal. The confused-deputy *finding*
+  (`TrustPolicyNoExternalId`) is reported separately, but the attack edge itself
+  does not model the condition.
+- **Explicit `Deny` and permission boundaries are not subtracted — fix in discovery.**
+  This affects *both* the security assessment and the privilege-escalation scan:
+  they build each principal's permissions from a single shared function
+  (`_collect_allowed_actions`) that reads `Effect: Allow` statements only and
+  never subtracts an explicit `Deny` or a permissions boundary. So a permission
+  granted by an `Allow` but blocked by a `Deny` or boundary can still surface as
+  a finding *and* as an attack-graph edge. The effect is one-directional: the
+  engine can over-report, but it never under-reports (it will not hide a real
+  path). A fix is under investigation, staged by cost and risk:
+    1. Subtract unconditional, account-wide denies (`Resource: *`, no
+       `Condition`) from the permission set. Always safe to remove, since such a
+       deny blocks the action everywhere; catches the common guardrail-deny case
+       and, because the function is shared, fixes both engines at once.
+    2. Resource-scoped and `NotAction`/`NotResource` denies, evaluated per edge
+       against the target (larger; touches every edge generator).
+    3. Conditional denies and boundaries, ideally via the authoritative
+       `SimulatePrincipalPolicy` results captured at enumeration time, rather
+       than re-implementing IAM evaluation.
+- **Cross-account reasoning requires both accounts to be enumerated.** Access to
+  an ARN that was never collected cannot be confirmed against its resource
+  policy, so such edges are left in place rather than guessed away.

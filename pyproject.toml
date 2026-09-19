@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "worstassume"
-version = "0.1.0"
+version = "1.0.0"
 description = "Stealth-first AWS IAM enumeration and multi-account graph tool"
 requires-python = ">=3.10"
 dependencies = [
